@@ -1,16 +1,16 @@
 # ComfyUI-MiniMaxH3-Easy-Extended
 > extended fork of [nkxx188/ComfyUI-MiniMaxH3-Easy](https://github.com/nkxx188/ComfyUI-MiniMaxH3-Easy).
-Extends the original Easy nodes with broader MiniMax H3 workflow support, improved reference/audio handling, and a prompt editor built around H3's prompting format.
+Builds on the original Easy nodes with H3-specific prompt suggestions, autocomplete, and a handful of fixes & reference/audio improvements.
 
 ## Prompting
 The main focus is the prompt editor: less manual H3 prompt structure, fewer tags to remember, and faster reference prompting. 
-BASED ON:
+
+**SUGGESTIONS BASED ON:**
 - Base prompting: https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md
 - Reference prompting: https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md
 - H3 docs: https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/main/docs
 
 Press **Tab** on an empty prompt to pick a starter such as T2V/T2VA, REF2VA, T2A or REF2A. Templates contain editable fields:
-
 - **Tab** -> next field
 - **Shift+Tab** -> previous field
 - **Up / Down + Enter** -> choose a contextual suggestion
@@ -83,7 +83,7 @@ Clone into:
 ComfyUI/custom_nodes/ComfyUI-MiniMaxH3-Easy-Extended
 ```
 
-Models use the normal ComfyUI folders:
+Model selection uses the normal ComfyUI folders:
 
 ```text
 ComfyUI/models/diffusion_models/
