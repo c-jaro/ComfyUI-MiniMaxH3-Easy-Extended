@@ -1,8 +1,41 @@
 # ComfyUI-MiniMaxH3-Easy-Extended
 
-> extended fork of [nkxx188/ComfyUI-MiniMaxH3-Easy](https://github.com/nkxx188/ComfyUI-MiniMaxH3-Easy).
+> **WIP** extended fork of [nkxx188/ComfyUI-MiniMaxH3-Easy](https://github.com/nkxx188/ComfyUI-MiniMaxH3-Easy).
 
 Adds broader MiniMax H3 workflow support, improved reference handling, and expanded prompt tooling on top of the original Easy nodes.
+
+## Prompting
+
+The main addition is the prompt editor. It is meant to avoid manually remembering H3 prompt structure, tags, and reference syntax.
+
+Press **Tab** on an empty prompt to pick a starter such as T2V/T2VA, REF2VA, T2A or REF2A. Templates contain editable fields:
+
+- **Tab** -> next field
+- **Shift+Tab** -> previous field
+- **Up / Down + Enter** -> choose a contextual suggestion
+- typing replaces the selected field
+
+Suggestions change with the current field, so camera, movement, scene, dialogue, voice, sound and other options show up where they are relevant.
+
+Type **`@`** to reference connected media:
+
+```text
+@Image1
+@Video1
+@Audio1
+@Subject1
+```
+
+After selecting a reference, a second menu offers role/description templates for that reference. `@Audio1`, for example, can be used as a voice reference, music style, dialogue/lyrics source, SFX/ambience reference, rhythm reference, or direct signal reference.
+
+Other editor shortcuts are context-aware:
+
+- **`#`** -> dialogue / singing / voiceover helpers
+- **`[`** -> shot, task or language helpers
+- **`(`** -> speaker IDs where applicable
+- **`:`** -> Ref2VA retention choices
+
+The **Compiled Prompt** preview shows the final MiniMax prompt after Easy expands the helper syntax.
 
 ## Main changes
 
@@ -10,15 +43,18 @@ Adds broader MiniMax H3 workflow support, improved reference handling, and expan
 - T2VA, I2VA, first/last-frame, reference and audio workflows
 - improved image, video and reference preprocessing
 - H3-specific prompt templates and validation
-- `@ImageN`, `@VideoN`, `@AudioN` and `@SubjectN` references
-- follow-up templates after inserting an `@` reference
-- dialogue helpers and expanded language options
 - audio-only mode
+- broader language and dialogue helpers
 - selected model / route info and compiled prompt preview
 - loader fixes and compatibility with older Easy workflows
-- regression tests for routing, references and prompt behavior
 
 Still WIP. UI and behavior may change.
+
+## Example workflow
+
+An example graph is included in [`minimax_h3_easy-extended.json`](minimax_h3_easy-extended.json).
+
+The Sage / SolAttn / cache nodes in the example are optional acceleration nodes and are not required by MiniMax H3 Easy itself.
 
 ## Usage
 
@@ -31,17 +67,6 @@ Routing follows the connected inputs:
 - reference image/video/audio -> Ref2VA
 
 Prompt mode affects prompt assistance only. It does not select the runtime route.
-
-For reference workflows, type `@` in the prompt editor and select a connected input:
-
-```text
-@Image1
-@Video1
-@Audio1
-@Subject1
-```
-
-These are compiled to MiniMax's native reference tags before execution.
 
 ## Install
 
@@ -60,13 +85,6 @@ ComfyUI/models/vae/
 ```
 
 Restart ComfyUI after installing or updating.
-
-## Notes
-
-- Reference inputs use the Ref2VA path.
-- Endpoint frames connected together with references are not forwarded on the Ref2VA route; the node shows a warning.
-- Standalone reference audio can be addressed with `@AudioN`.
-- The main node outputs a normal ComfyUI `MODEL`, so LoRA, Sage and other model patches can be chained after it.
 
 ## Credits
 
