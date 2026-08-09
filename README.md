@@ -17,13 +17,14 @@ Press **Tab** on an empty prompt to choose **Custom** or any T2V, I2V, L2V, FL2V
 
 Reference audio proxies keep the guide's roles separate. `@ImageN` supplies provenance for visible content defined as `@SubjectN`, and `@VideoN` describes editing, continuation, or whole-video timing/structure. `@AudioN` names standalone Reference audio; `@VideoAudioN` names the enabled soundtrack attached to visible Reference Video N. Either audio source needs its own definition and copy/reference relationship. V2A does not treat a video's mere presence as an audio-reuse instruction.
 
-<img width="49%" alt="3_" src="https://github.com/user-attachments/assets/f7003c65-a12a-492d-bfc6-c5c2dc758e3e" />
+
 
 <p>
 <img width="32%" alt="1" src="https://github.com/user-attachments/assets/58564f04-b1e1-43a6-b94c-b0dc7792a01b" />
 <img width="32%" alt="2" src="https://github.com/user-attachments/assets/08a7e0e5-ad2b-42d8-8da4-ac1b5a47098c" />
 <img width="32%" alt="3" src="https://github.com/user-attachments/assets/fe38c985-f490-4740-8f66-ad4807d50f92" />
 </p>
+<img width="32%" alt="3_" src="https://github.com/user-attachments/assets/f7003c65-a12a-492d-bfc6-c5c2dc758e3e" />
 
 Suggestions change with the current field, so camera, movement, scene, dialogue, voice, sound and other options show up where they are relevant.
 
