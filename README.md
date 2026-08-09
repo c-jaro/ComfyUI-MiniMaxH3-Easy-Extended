@@ -21,7 +21,7 @@ A compact workflow frontend for ComfyUI's native MiniMax H3 implementation. It p
 <img width="32%" alt="3" src="https://github.com/user-attachments/assets/514fc74d-52f5-45d4-bd67-9ef5ef555c81" />
 </p>
 
-<img width="32%" height="900" alt="3_" src="https://github.com/user-attachments/assets/bac21c82-9222-4c18-b968-6abf93ceb2fd" />
+<img width="32%" alt="3_" src="https://github.com/user-attachments/assets/bac21c82-9222-4c18-b968-6abf93ceb2fd" />
 
 ## Requirements and installation
 
