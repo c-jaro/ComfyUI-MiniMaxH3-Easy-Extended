@@ -4,6 +4,8 @@ import {
   AUDIO_RETENTION,
   BASE_SECTIONS,
   CAMERA,
+  CONDITIONING_MODEL_FL2VA,
+  CONDITIONING_MODEL_REF2VA,
   descriptionOptions,
   EDITOR_PLACEHOLDER_HELP,
   KEYFRAME_FIRST,
@@ -33,12 +35,31 @@ import {
 const EXTENSION = "MiniMax.H3.Easy.V4.Editor";
 const NODE_CLASS = "MiniMaxH3EasyV4";
 const PROMPT_WIDGET = "minimax-h3-easy-prompt-editor";
+const MENU_LAYOUT_HEIGHT = 220;
+const WIDGET_REFRESH_DELAY = 50;
 const controllers = new WeakMap();
-const modelSourceObservers = new WeakMap();
-const AUTO_AUDIO_MODEL_LABEL = "Auto (match conditioning)";
 let legacyMigrationCount = 0;
 
 const EDITOR_PLACEHOLDER_RE = /\{[^{}\n]+\}/g;
+
+function filledPresetCandidates() {
+  const seen = new Set();
+  const candidates = [];
+  for (const key of Object.keys(EDITOR_PLACEHOLDER_HELP)) {
+    for (const choice of presetChoicesForPlaceholder(key)) {
+      const text = String(choice?.insertText || "").trim();
+      if (text.length < 3 || /[{}\n]/.test(text)) continue;
+      const signature = `${key}\u0000${text}`;
+      if (seen.has(signature)) continue;
+      seen.add(signature);
+      candidates.push({ key, text });
+    }
+  }
+  return candidates.sort((a, b) => b.text.length - a.text.length || a.key.localeCompare(b.key));
+}
+
+const FILLED_PRESET_CANDIDATES = Object.freeze(filledPresetCandidates());
+const MAX_FILLED_PRESET_LENGTH = FILLED_PRESET_CANDIDATES.reduce((longest, candidate) => Math.max(longest, candidate.text.length), 0);
 
 function isKnownEditorPlaceholder(text) {
   const raw = String(text || "");
@@ -83,6 +104,47 @@ function editorPlaceholderAtSelection(textarea) {
   return null;
 }
 
+function filledPresetAtCaret(textarea) {
+  const source = String(textarea?.value || "");
+  const caret = Math.max(0, Number(textarea?.selectionStart) || 0);
+  const selectionEnd = Math.max(caret, Number(textarea?.selectionEnd) || 0);
+  if (caret !== selectionEnd) return null;
+  const windowStart = Math.max(0, caret - MAX_FILLED_PRESET_LENGTH + 1);
+  const windowEnd = Math.min(source.length, caret + MAX_FILLED_PRESET_LENGTH);
+  const nearby = source.slice(windowStart, windowEnd);
+  const matches = [];
+  for (const candidate of FILLED_PRESET_CANDIDATES) {
+    let localStart = nearby.indexOf(candidate.text);
+    while (localStart >= 0) {
+      const start = windowStart + localStart;
+      const end = start + candidate.text.length;
+      if (caret > start && caret < end
+        && !(/^[A-Za-z0-9]/.test(candidate.text) && /[A-Za-z0-9]/.test(source[start - 1] || ""))
+        && !(/[A-Za-z0-9]$/.test(candidate.text) && /[A-Za-z0-9]/.test(source[end] || ""))) {
+        matches.push({ ...candidate, start, end });
+        break;
+      }
+      localStart = nearby.indexOf(candidate.text, localStart + 1);
+    }
+  }
+  if (!matches.length) return null;
+
+  const longest = matches[0].text.length;
+  const longestMatches = matches.filter((match) => match.text.length === longest);
+  if (new Set(longestMatches.map((match) => `${match.start}:${match.end}`)).size !== 1) return null;
+  const exact = longestMatches.filter((match) => match.start === longestMatches[0].start && match.end === longestMatches[0].end);
+  const keys = new Set(exact.map((match) => match.key));
+  if (keys.size === 1) return exact[0];
+
+  const before = source.slice(Math.max(0, exact[0].start - 80), exact[0].start);
+  const after = source.slice(exact[0].end, Math.min(source.length, exact[0].end + 80));
+  if (keys.has("shot size / framing") && /(?:the shot uses|new shot using)\s*$/i.test(before) && /^\s+framing\b/i.test(after)) {
+    return exact.find((match) => match.key === "shot size / framing");
+  }
+  if (keys.has("viewpoint") && /\bframing from\s*$/i.test(before)) return exact.find((match) => match.key === "viewpoint");
+  return null;
+}
+
 function highlightPlaceholderReplacement(textarea, placeholder) {
   if (!textarea || !placeholder) return false;
   const start = Math.max(0, Number(placeholder.start) || 0);
@@ -113,9 +175,6 @@ function selectAdjacentEditorPlaceholder(textarea, direction = 1) {
 const FRIENDLY_WIDGET_LABELS = new Map([
   ["ref_image_size", "Reference image resolution"],
   ["ref_video_size", "Reference video resolution"],
-  ["ref_video_fps", "Video 1 source FPS"],
-  ["ref_video_fps_2", "Video 2 source FPS"],
-  ["ref_video_fps_3", "Video 3 source FPS"],
   ["ref_video_temporal_fit", "Reference video end handling"],
   ["keyframe_role", "Image 1 is"],
   ["keyframe_canvas", "Video aspect ratio source"],
@@ -126,6 +185,10 @@ const FRIENDLY_WIDGET_LABELS = new Map([
   ["width", "Custom output width"],
   ["height", "Custom output height"],
   ["seconds", "Requested duration (s)"],
+  ["conditioning_model", "Model"],
+  ["ref_video_use_audio_0", "Use Video 1 soundtrack"],
+  ["ref_video_use_audio_1", "Use Video 2 soundtrack"],
+  ["ref_video_use_audio_2", "Use Video 3 soundtrack"],
 ]);
 
 function widgetNameMatches(name, suffix) {
@@ -134,6 +197,19 @@ function widgetNameMatches(name, suffix) {
     || value.endsWith(`.${suffix}`)
     || value.endsWith(`:${suffix}`)
     || value.endsWith(`/${suffix}`);
+}
+
+function widgetValue(node, suffix, fallback) {
+  const widget = (node?.widgets || []).find((item) => widgetNameMatches(item?.name, suffix));
+  return widget?.value ?? fallback;
+}
+
+function autogrowInputSlot(name, prefix) {
+  const value = String(name ?? "");
+  const leaf = value.split(/[.:/]/).at(-1) || value;
+  if (!leaf.startsWith(prefix)) return null;
+  const suffix = leaf.slice(prefix.length);
+  return /^\d+$/.test(suffix) ? Number(suffix) : null;
 }
 
 function applyFriendlyWidgetLabels(node) {
@@ -146,6 +222,50 @@ function applyFriendlyWidgetLabels(node) {
   }
 }
 
+function applyFriendlyInputLabels(node) {
+  const labelFor = (name) => {
+    const leaf = String(name ?? "").split(/[.:/]/).pop() || "";
+    let match = /^keyframe_(\d+)$/.exec(leaf);
+    if (match) return Number(match[1]) === 0 ? "First / last frame" : "Last frame";
+    match = /^ref_image_(\d+)$/.exec(leaf);
+    if (match) return `Reference image ${Number(match[1]) + 1}`;
+    match = /^ref_video_(\d+)$/.exec(leaf);
+    if (match) return `Reference video ${Number(match[1]) + 1}`;
+    match = /^ref_audio_(\d+)$/.exec(leaf);
+    if (match) return `Reference audio ${Number(match[1]) + 1}`;
+    return null;
+  };
+  for (const input of node?.inputs || []) {
+    const label = labelFor(input?.name);
+    if (label) input.label = label;
+  }
+}
+
+const LEGACY_EXPLICIT_REF_MODES = new Set([
+  "Full Reference (REF2VA)",
+  "References (REF2VA)",
+  "Reference conditioning",
+]);
+
+const LEGACY_EXPLICIT_FL_MODES = new Set([
+  "Base / Keyframes (T2VA/I2VA/FL2VA/L2VA)",
+  "Text / first-last frames (T2VA / I2VA / L2VA / FL2VA)",
+]);
+const LEGACY_AUDIO_MODES = new Set([
+  "Audio-first",
+  "Audio-first proxy (T2A / A2A / V2A)",
+  "Audio-first proxy (T2A / I2A / V2A / A2A)",
+]);
+const REMOVED_AUDIO_MODEL = "Audio override";
+const pendingLegacyModels = new Map();
+
+function legacyModelSelection(value) {
+  const raw = String(value ?? "");
+  if (LEGACY_EXPLICIT_REF_MODES.has(raw)) return CONDITIONING_MODEL_REF2VA;
+  if (LEGACY_EXPLICIT_FL_MODES.has(raw)) return CONDITIONING_MODEL_FL2VA;
+  return null;
+}
+
 const VALUE_ALIASES = Object.freeze({
   mode: new Map([
     ["Full Reference (REF2VA)", MODE_VIDEO],
@@ -156,6 +276,12 @@ const VALUE_ALIASES = Object.freeze({
     ["Audio-first proxy (T2A / A2A / V2A)", MODE_AUDIO],
     ["Audio-first proxy (T2A / I2A / V2A / A2A)", MODE_AUDIO],
     ["Audio-first", MODE_AUDIO],
+  ]),
+  conditioning_model: new Map([
+    ["Text / frame", CONDITIONING_MODEL_FL2VA],
+    ["Text / first-last frames", CONDITIONING_MODEL_FL2VA],
+    ["Reference conditioning", CONDITIONING_MODEL_REF2VA],
+    ["Audio model from Loader", REMOVED_AUDIO_MODEL],
   ]),
   keyframe_role: new Map([
     ["Image 1 = first frame", KEYFRAME_FIRST],
@@ -181,16 +307,23 @@ const VALUE_ALIASES = Object.freeze({
     ["Allow stretch (core behavior)", "Stretch to output (distorts)"],
   ]),
   ref_image_size: new Map([
-    ["Auto match generation area", "Balanced to output area (may upscale)"],
-    ["Match output pixel area", "Balanced to output area (may upscale)"],
-    ["Max fidelity (2048px short edge)", "2048px short-edge cap (no upscale)"],
-    ["2048px short edge (maximum detail)", "2048px short-edge cap (no upscale)"],
+    ["Auto match generation area", "Match output area (predictable token cost)"],
+    ["Match output pixel area", "Match output area (predictable token cost)"],
+    ["Balanced to output area (may upscale)", "Match output area (predictable token cost)"],
+    ["Max fidelity (2048px short edge)", "Preserve source detail (2048px short-edge cap; slower)"],
+    ["2048px short edge (maximum detail)", "Preserve source detail (2048px short-edge cap; slower)"],
+    ["2048px short-edge cap (no upscale)", "Preserve source detail (2048px short-edge cap; slower)"],
+    ["Preserve source detail (2048px cap; slower)", "Preserve source detail (2048px short-edge cap; slower)"],
   ]),
   ref_video_size: new Map([
-    ["768P native (best fidelity)", "768P native"],
-    ["640P balanced", "640P downscaled"],
-    ["576P faster", "576P downscaled"],
-    ["512P fastest", "512P downscaled"],
+    ["768P native (best fidelity)", "768-class cap (most detail)"],
+    ["640P balanced", "640-class cap"],
+    ["576P faster", "576-class cap"],
+    ["512P fastest", "512-class cap"],
+    ["768P native", "768-class cap (most detail)"],
+    ["640P downscaled", "640-class cap"],
+    ["576P downscaled", "576-class cap"],
+    ["512P downscaled", "512-class cap"],
   ]),
   ref_video_temporal_fit: new Map([
     ["Core exact: trim tail to 17k+5", "Trim tail to valid H3 frame count"],
@@ -219,11 +352,24 @@ function repairCoreWidgetDefaults(node) {
   };
 
   const mode = byName("mode");
+  const rawLegacyMode = String(mode?.value ?? "");
+  // v1/v2 workflows sometimes encoded the checkpoint choice directly in Mode.
+  // Preserve that historical choice when upgrading to the dedicated Model widget.
+  const pendingLegacyModel = String(pendingLegacyModels.get(node?.id) ?? "");
+  pendingLegacyModels.delete(node?.id);
+  const legacyExplicitModel = [CONDITIONING_MODEL_FL2VA, CONDITIONING_MODEL_REF2VA, REMOVED_AUDIO_MODEL].includes(pendingLegacyModel)
+    ? pendingLegacyModel
+    : legacyModelSelection(rawLegacyMode);
   if (mode) {
     mode.value = canonicalWidgetValue("mode", mode.value);
     if (![MODE_VIDEO, MODE_AUDIO].includes(String(mode.value ?? ""))) mode.value = H3E_DEFAULTS.mode;
   }
 
+  const conditioningModel = byName("conditioning_model");
+  if (conditioningModel && legacyExplicitModel) conditioningModel.value = legacyExplicitModel;
+  if (String(conditioningModel?.value ?? "") !== REMOVED_AUDIO_MODEL) {
+    repairChoice("conditioning_model", H3E_VALID.conditioningModel, H3E_DEFAULTS.conditioningModel);
+  }
   repairChoice("keyframe_role", H3E_VALID.keyframeRole, H3E_DEFAULTS.keyframeRole);
   repairChoice("keyframe_canvas", H3E_VALID.keyframeCanvas, H3E_DEFAULTS.keyframeCanvas);
   repairChoice("first_frame_resize", H3E_VALID.firstFrameResize, H3E_DEFAULTS.firstFrameResize);
@@ -235,9 +381,6 @@ function repairCoreWidgetDefaults(node) {
   repairChoice("aspect_ratio", H3E_VALID.aspectRatio, H3E_DEFAULTS.aspectRatio);
 
   repairNumber("seconds", H3E_DEFAULTS.seconds, 1, 30);
-  repairNumber("ref_video_fps", H3E_DEFAULTS.refVideoFps, 1, 240);
-  repairNumber("ref_video_fps_2", H3E_DEFAULTS.refVideoFpsOverride, 0, 240);
-  repairNumber("ref_video_fps_3", H3E_DEFAULTS.refVideoFpsOverride, 0, 240);
 
   const width = byName("width");
   if (width && (!Number.isFinite(Number(width.value)) || Number(width.value) <= 0)) width.value = H3E_DEFAULTS.customWidth;
@@ -247,10 +390,9 @@ function repairCoreWidgetDefaults(node) {
 
 
 // Native widgets must still be CREATED before the DOM prompt widget so workflow
-// serialization stays compatible. Visually, keep only Mode above the editor:
-// Mode -> prompt editor -> every other visible control. The remaining controls
-// preserve their native relative order below the editor.
-function layoutVisibilityState(node, controller = null, routeState = null) {
+// serialization stays compatible. Model selects a Loader checkpoint; connected
+// media independently determines which native conditioning builder is visible.
+function layoutVisibilityState(node, controller = null, derivedState = null) {
   const value = (id, fallback) => {
     const widget = (node?.widgets || []).find((item) => widgetNameMatches(item?.name, id));
     return widget?.value ?? fallback;
@@ -261,23 +403,19 @@ function layoutVisibilityState(node, controller = null, routeState = null) {
   const keyframeCanvas = String(value("keyframe_canvas", H3E_DEFAULTS.keyframeCanvas));
   const rawKeyframeCount = connectedInputs(node, "keyframe_").length;
   const rawImageCount = connectedInputs(node, "ref_image_").length;
-  const rawVideoCount = connectedInputs(node, "ref_video_").length;
+  const videoInputs = connectedInputs(node, "ref_video_");
+  const rawVideoCount = videoInputs.length;
+  const connectedVideoSlots = new Set(videoInputs.map((input) => autogrowInputSlot(input?.name, "ref_video_")).filter(Number.isFinite));
   const hasReferenceInputs = rawImageCount + rawVideoCount
-    + connectedInputs(node, "ref_video_audio_").length
     + connectedInputs(node, "ref_audio_").length > 0;
-  const activeRoute = routeState || controller?.getState?.() || null;
-  // Widget visibility mirrors the physical conditioning route only. Prompt
-  // structure can change editor assistance or be internally ambiguous without
-  // changing which connected inputs the backend will execute.
-  const endpointRouteActive = activeRoute
-    ? activeRoute.conditioningProfile !== PROFILE.REF2VA
-    : !hasReferenceInputs;
-  const referenceRouteActive = activeRoute
-    ? activeRoute.conditioningProfile === PROFILE.REF2VA
+  const activeState = derivedState || controller?.getState?.() || null;
+  const referenceBuilderActive = activeState
+    ? activeState.conditioningProfile === PROFILE.REF2VA
     : hasReferenceInputs;
-  const keyframeCount = endpointRouteActive ? rawKeyframeCount : 0;
-  const imageCount = referenceRouteActive ? rawImageCount : 0;
-  const videoCount = referenceRouteActive ? rawVideoCount : 0;
+  const endpointBuilderActive = !referenceBuilderActive;
+  const keyframeCount = endpointBuilderActive ? rawKeyframeCount : 0;
+  const imageCount = referenceBuilderActive ? rawImageCount : 0;
+  const videoCount = referenceBuilderActive ? rawVideoCount : 0;
   const videoMode = mode !== MODE_AUDIO;
   const hasOpeningFrame = keyframeCount >= 2 || (keyframeCount === 1 && keyframeRole === KEYFRAME_FIRST);
   const hasEndingFrame = keyframeCount >= 2 || (keyframeCount === 1 && keyframeRole === KEYFRAME_LAST);
@@ -293,8 +431,8 @@ function layoutVisibilityState(node, controller = null, routeState = null) {
   return {
     mode, canvas, keyframeRole, keyframeCanvas,
     keyframeCount, imageCount, videoCount,
-    rawKeyframeCount, rawImageCount, rawVideoCount,
-    endpointRouteActive, referenceRouteActive,
+    rawKeyframeCount, rawImageCount, rawVideoCount, connectedVideoSlots,
+    endpointBuilderActive, referenceBuilderActive,
     videoMode, hasOpeningFrame, hasEndingFrame, frameDrivesAspect, endingFrameDrivesAspect,
   };
 }
@@ -303,7 +441,7 @@ function layoutWidgetVisibility(widget, controller, state) {
   if (widget === controller.widget) return true;
   const name = String(widget?.name ?? "");
   const is = (id) => widgetNameMatches(name, id);
-  if (is("mode") || is("seconds")) return true;
+  if (is("mode") || is("conditioning_model") || is("seconds")) return true;
 
   // Output controls matter only when the video is retained.
   if (is("canvas")) return state.videoMode;
@@ -312,24 +450,24 @@ function layoutWidgetVisibility(widget, controller, state) {
 
   // Endpoint-policy widgets stay serialized but appear only when they can affect
   // a connected endpoint workflow. The endpoint sockets themselves never change.
-  if (is("keyframe_role")) return state.videoMode && state.keyframeCount > 0;
+  if (is("keyframe_role")) return state.keyframeCount > 0;
   if (is("keyframe_canvas")) return state.videoMode && state.keyframeCount > 0 && state.canvas !== "Custom exact";
   if (is("first_frame_resize")) {
-    return state.videoMode
-      && state.hasOpeningFrame
-      && (state.canvas === "Custom exact" || state.keyframeCanvas !== KEYFRAME_CANVAS_ADAPTIVE);
+    return state.hasOpeningFrame
+      && (!state.videoMode || state.canvas === "Custom exact" || state.keyframeCanvas !== KEYFRAME_CANVAS_ADAPTIVE);
   }
   if (is("last_frame_resize")) {
-    return state.videoMode && state.hasEndingFrame && !state.endingFrameDrivesAspect;
+    return state.hasEndingFrame && !state.endingFrameDrivesAspect;
   }
 
   // Reference preprocessing controls appear only for the corresponding connected
   // media. Audio-only still uses reference-video geometry/FPS, but deliberately
   // ignores the still-image size selector to protect I2A refs from the 32x32 proxy.
   if (is("ref_image_size")) return state.imageCount > 0 && state.videoMode;
-  if (is("ref_video_size") || is("ref_video_fps") || is("ref_video_temporal_fit")) return state.videoCount > 0;
-  if (is("ref_video_fps_2")) return state.videoCount > 1;
-  if (is("ref_video_fps_3")) return state.videoCount > 2;
+  if (is("ref_video_size") || is("ref_video_temporal_fit")) return state.videoCount > 0;
+  for (let index = 0; index < 3; index += 1) {
+    if (is(`ref_video_use_audio_${index}`)) return state.connectedVideoSlots?.has(index) ?? state.rawVideoCount > index;
+  }
 
   // Unknown/native widgets are not managed here. This matters because another
   // extension (or ComfyUI itself) may intentionally own their hidden state.
@@ -341,8 +479,8 @@ function layoutWidgetVisibility(widget, controller, state) {
 // filtering getLayoutWidgets therefore leaves an omitted widget drawable at a
 // stale/default y coordinate. Keep `hidden` synchronized for the H3 controls we
 // conditionally collapse, while preserving any pre-existing hidden state.
-function syncLayoutWidgetVisibility(node, controller, routeState = null) {
-  const state = layoutVisibilityState(node, controller, routeState);
+function syncLayoutWidgetVisibility(node, controller, derivedState = null) {
+  const state = layoutVisibilityState(node, controller, derivedState);
   for (const widget of node?.widgets || []) {
     const visible = layoutWidgetVisibility(widget, controller, state);
     if (visible == null) continue;
@@ -364,6 +502,7 @@ function syncLayoutWidgetVisibility(node, controller, routeState = null) {
       delete widget.__h3EasyVisibilityManaged;
     }
   }
+  if (controller) controller.layoutVisibilityState = state;
   return state;
 }
 
@@ -391,7 +530,7 @@ function installPromptFirstLayout(node, controller) {
     let state;
     let widgets;
     try {
-      state = syncLayoutWidgetVisibility(this, controller);
+      state = controller.layoutVisibilityState || syncLayoutWidgetVisibility(this, controller);
       widgets = previousGetLayoutWidgets.apply(this, args);
     } catch (error) {
       console.error("[MiniMax H3 Easy] Widget layout failed; falling back to ComfyUI's native widget order.", error);
@@ -402,9 +541,11 @@ function installPromptFirstLayout(node, controller) {
 
     const rest = [];
     let modeWidget = null;
+    let conditioningWidget = null;
     let promptWidget = null;
     for (const widget of widgets) {
       if (widgetNameMatches(widget?.name, "mode")) { modeWidget = widget; continue; }
+      if (widgetNameMatches(widget?.name, "conditioning_model")) { conditioningWidget = widget; continue; }
       if (widget === controller.widget) { promptWidget = widget; continue; }
       if (widget === controller.nativePromptWidget) continue;
       if (layoutWidgetVisibility(widget, controller, state) !== false) rest.push(widget);
@@ -432,7 +573,16 @@ function installPromptFirstLayout(node, controller) {
       const openingResizeIndex = rest.findIndex((widget) => widgetNameMatches(widget?.name, "first_frame_resize"));
       rest.splice(openingResizeIndex >= 0 ? openingResizeIndex + 1 : 0, 0, endingResize);
     }
-    return [modeWidget, promptWidget, ...afterPrompt, ...rest].filter(Boolean);
+    const soundtrackWidgets = [];
+    for (let index = 0; index < 3; index += 1) {
+      const widget = takeWidget((item) => widgetNameMatches(item?.name, `ref_video_use_audio_${index}`));
+      if (widget) soundtrackWidgets.push(widget);
+    }
+    if (soundtrackWidgets.length) {
+      const temporalIndex = rest.findIndex((widget) => widgetNameMatches(widget?.name, "ref_video_temporal_fit"));
+      rest.splice(temporalIndex >= 0 ? temporalIndex + 1 : rest.length, 0, ...soundtrackWidgets);
+    }
+  return [conditioningWidget, modeWidget, promptWidget, ...afterPrompt, ...rest].filter(Boolean);
   };
 
   const dispose = () => {
@@ -448,7 +598,7 @@ function installPromptFirstLayout(node, controller) {
   node.__h3EasyV4LayoutDispose = dispose;
   controller.disposeLayout = dispose;
   syncLayoutWidgetVisibility(node, controller);
-  node.graph?.setDirtyCanvas?.(true, true);
+  node.graph?.setDirtyCanvas?.(true, false);
 }
 
 
@@ -457,64 +607,63 @@ function injectStyles() {
   const style = document.createElement("style");
   style.id = "minimax-h3-easy-v2-styles";
   style.textContent = `
-    .h3e-editor { position:relative; box-sizing:border-box; width:100%; height:100%; min-height:260px; display:flex; flex-direction:column; gap:6px; padding:6px; font:12px/1.35 system-ui,sans-serif; color:var(--fg-color,#ddd); background:color-mix(in srgb,var(--comfy-menu-bg,#222) 90%,transparent); border:1px solid color-mix(in srgb,var(--border-color,#555) 75%,transparent); border-radius:7px; }
-    .h3e-model-line, .h3e-compiled-line { flex:0 0 auto; min-width:0; color:#98a6b8; font:10.5px/1.25 ui-monospace,SFMono-Regular,Consolas,monospace; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; padding:0 1px; }
-    .h3e-compiled-line { color:#7f8c9f; cursor:pointer; border-radius:3px; outline:none; }
-    .h3e-compiled-line:hover, .h3e-compiled-line:focus-visible { background:rgba(255,255,255,.045); }
-    .h3e-compiled-line.is-unresolved { color:#d7a76d; }
-    .h3e-compiled-panel { flex:0 0 auto; display:flex; flex-direction:column; gap:5px; max-height:150px; padding:6px 7px; border:1px solid rgba(120,145,185,.25); border-radius:5px; background:rgba(12,14,18,.68); }
-    .h3e-compiled-panel[hidden] { display:none; }
-    .h3e-compiled-pre { margin:0; min-height:0; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; color:#aab6c8; font:10px/1.38 ui-monospace,SFMono-Regular,Consolas,monospace; user-select:text; }
-    .h3e-compiled-actions { display:flex; justify-content:flex-end; }
-    .h3e-compiled-copy { min-width:52px; padding:2px 7px; border:1px solid rgba(120,145,185,.3); border-radius:4px; color:#b9c6d8; background:rgba(120,145,185,.08); font:800 9.5px/1.4 system-ui,sans-serif; cursor:pointer; }
-    .h3e-compiled-copy:hover:not(:disabled), .h3e-compiled-copy:focus-visible:not(:disabled) { background:rgba(120,145,185,.16); }
-    .h3e-compiled-copy:disabled { opacity:.35; cursor:default; }
+    .h3e-editor { position:relative; box-sizing:border-box; width:100%; height:100%; min-height:0; overflow:hidden; display:flex; flex-direction:column; gap:5px; padding:6px; font:12px/1.35 system-ui,sans-serif; color:var(--fg-color,#ddd); background:color-mix(in srgb,var(--comfy-menu-bg,#222) 90%,transparent); border:1px solid color-mix(in srgb,var(--border-color,#555) 75%,transparent); border-radius:7px; }
     .h3e-route-notice { flex:0 0 auto; padding:4px 7px; border-left:3px solid rgba(255,179,92,.72); border-radius:4px; color:#e0b77f; background:rgba(255,179,92,.07); font:800 10.5px/1.35 system-ui,sans-serif; }
     .h3e-route-notice[hidden] { display:none; }
-    .h3e-head { display:flex; align-items:center; gap:8px; min-height:22px; }
-    .h3e-profile { flex:0 0 auto; padding:3px 7px; border-radius:999px; font-weight:800; letter-spacing:.02em; background:rgba(88,145,255,.16); color:#a9c7ff; border:1px solid rgba(88,145,255,.27); }
-    .h3e-status { min-width:0; flex:1; color:inherit; text-align:left; cursor:help; border-radius:4px; outline:none; }
+    .h3e-head { display:flex; align-items:center; gap:6px; min-height:18px; }
+    .h3e-profile { flex:0 0 auto; padding:2px 6px; border-radius:999px; font-size:10.5px; font-weight:800; letter-spacing:.02em; background:rgba(88,145,255,.16); color:#a9c7ff; border:1px solid rgba(88,145,255,.27); }
+    .h3e-summary { flex:0 0 auto; min-width:0; display:flex; align-items:center; gap:6px; min-height:20px; color:#9facc0; font:800 9.5px/1.25 system-ui,sans-serif; }
+    .h3e-summary-state { min-width:0; flex:1; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .h3e-guide-progress { box-sizing:border-box; flex:0 1 48%; min-width:76px; max-width:48%; height:20px; overflow:hidden; padding:1px 6px; border:1px solid rgba(126,169,255,.28); border-radius:4px; color:#b8cff8; background:rgba(126,169,255,.07); font:800 9px/16px system-ui,sans-serif; white-space:nowrap; text-overflow:ellipsis; cursor:pointer; }
+    .h3e-guide-progress:hover:not(:disabled), .h3e-guide-progress:focus-visible:not(:disabled) { background:rgba(126,169,255,.16); }
+    .h3e-guide-progress:disabled { color:#8490a2; border-color:rgba(120,145,185,.18); background:rgba(120,145,185,.035); cursor:default; }
+    .h3e-status { min-width:0; flex:1; display:flex; align-items:center; gap:4px; color:inherit; text-align:left; cursor:help; border-radius:4px; outline:none; }
     .h3e-status.is-actionable { cursor:pointer; }
     .h3e-status.is-actionable:hover, .h3e-status.is-actionable:focus-visible { background:rgba(255,255,255,.045); }
-    .h3e-status-main { display:block; font-size:12px; font-weight:800; color:#d8e6ff; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .h3e-status-toggle { flex:0 0 auto; width:10px; color:#9caabd; font:900 10px/1 system-ui,sans-serif; text-align:center; }
+    .h3e-status-main { display:block; min-width:0; flex:1; font-size:11px; font-weight:800; color:#d8e6ff; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
     .h3e-status-main.is-error { color:#ffb35c; }
     .h3e-status-main.is-ok { color:#7bdba5; }
-    .h3e-diagnostic { display:none; flex:0 0 auto; border:1px solid rgba(255,179,92,.30); border-left:3px solid rgba(255,179,92,.72); border-radius:5px; padding:6px 8px; background:rgba(255,179,92,.07); color:#cbd3df; font-size:10.5px; line-height:1.38; overflow-wrap:anywhere; }
+    .h3e-diagnostic { display:none; flex:0 0 auto; min-height:0; max-height:120px; overflow:auto; border:1px solid rgba(255,179,92,.30); border-left:3px solid rgba(255,179,92,.72); border-radius:5px; padding:5px 7px; background:rgba(255,179,92,.07); color:#cbd3df; font-size:9.5px; line-height:1.3; }
     .h3e-diagnostic.open { display:block; }
     .h3e-diagnostic.is-note { border-color:rgba(126,169,255,.28); border-left-color:rgba(126,169,255,.72); background:rgba(126,169,255,.065); }
     .h3e-diagnostic.is-note .h3e-diagnostic-title { color:#abc8ff; }
     .h3e-diagnostic.is-note .h3e-diagnostic-button { border-color:rgba(126,169,255,.28); color:#c3d8ff; background:rgba(126,169,255,.08); }
     .h3e-diagnostic.is-note .h3e-diagnostic-button:hover:not(:disabled), .h3e-diagnostic.is-note .h3e-diagnostic-button:focus-visible:not(:disabled) { background:rgba(126,169,255,.16); }
-    .h3e-diagnostic-main { display:flex; align-items:flex-start; gap:8px; }
-    .h3e-diagnostic-copy { min-width:0; flex:1; }
-    .h3e-diagnostic-title { color:#ffbd72; font-weight:850; }
-    .h3e-diagnostic-nav { display:none; flex:0 0 auto; align-items:center; gap:3px; }
+    .h3e-diagnostic-main { display:block; }
+    .h3e-diagnostic-copy { min-width:0; }
+    .h3e-diagnostic-title { display:none; }
+    .h3e-diagnostic-message { display:block; white-space:normal; overflow-wrap:anywhere; }
+    .h3e-diagnostic-nav { display:none; flex:0 0 auto; align-items:center; gap:2px; }
     .h3e-diagnostic-nav.open { display:flex; }
-    .h3e-diagnostic-count { min-width:30px; text-align:center; color:#9caabd; font:800 9.5px/20px system-ui,sans-serif; }
-    .h3e-diagnostic-button { box-sizing:border-box; width:22px; height:20px; padding:0; border:1px solid rgba(255,179,92,.28); border-radius:4px; color:#ffd1a0; background:rgba(255,179,92,.08); font:900 13px/18px system-ui,sans-serif; cursor:pointer; }
+    .h3e-diagnostic-count { min-width:24px; text-align:center; color:#9caabd; font:800 8.5px/18px system-ui,sans-serif; }
+    .h3e-diagnostic-button { box-sizing:border-box; width:18px; height:18px; padding:0; border:1px solid rgba(255,179,92,.28); border-radius:4px; color:#ffd1a0; background:rgba(255,179,92,.08); font:900 11px/16px system-ui,sans-serif; cursor:pointer; }
     .h3e-diagnostic-button:hover:not(:disabled), .h3e-diagnostic-button:focus-visible:not(:disabled) { background:rgba(255,179,92,.18); }
     .h3e-diagnostic-button:disabled { opacity:.28; cursor:default; }
-    .h3e-diagnostic-example { display:block; margin-top:3px; color:#9caabd; font:10px/1.38 ui-monospace,SFMono-Regular,Consolas,monospace; }
-    .h3e-textarea { box-sizing:border-box; width:100%; flex:1 1 auto; min-height:150px; resize:none; border:1px solid rgba(130,145,170,.3); border-radius:6px; padding:9px 10px; outline:none; color:#e6e8ec; background:rgba(12,14,18,.84); font:12px/1.48 ui-monospace,SFMono-Regular,Consolas,monospace; tab-size:4; white-space:pre-wrap; }
+    .h3e-diagnostic-example { display:block; margin-top:4px; color:#9caabd; font:9px/1.3 ui-monospace,SFMono-Regular,Consolas,monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
+    .h3e-diagnostic-apply { margin-top:5px; padding:3px 7px; border:1px solid rgba(255,179,92,.34); border-radius:4px; color:#ffd1a0; background:rgba(255,179,92,.10); font:800 9px/1.25 system-ui,sans-serif; cursor:pointer; }
+    .h3e-diagnostic-apply:hover, .h3e-diagnostic-apply:focus-visible { background:rgba(255,179,92,.20); }
+    .h3e-diagnostic-apply[hidden] { display:none; }
+    .h3e-textarea { box-sizing:border-box; width:100%; flex:1 1 96px; min-height:72px; overflow:auto; resize:none; border:1px solid rgba(130,145,170,.3); border-radius:6px; padding:9px 10px; outline:none; color:#e6e8ec; background:rgba(12,14,18,.84); font:12px/1.48 ui-monospace,SFMono-Regular,Consolas,monospace; tab-size:4; white-space:pre-wrap; }
     .h3e-textarea:focus { border-color:rgba(99,155,255,.72); box-shadow:0 0 0 1px rgba(99,155,255,.15); }
     .h3e-textarea::selection { background:rgba(76,132,224,.78); color:#fff; }
-    .h3e-contextbar { display:flex; align-items:flex-start; gap:7px; min-height:28px; }
+    .h3e-contextbar { display:none; }
     .h3e-hint { min-width:0; flex:1; color:#8d99aa; font-size:10.5px; line-height:1.35; white-space:normal; overflow-wrap:anywhere; }
-    .h3e-menu { position:relative; z-index:2; flex:0 0 auto; width:100%; box-sizing:border-box; max-height:min(260px,38vh); overflow:auto; display:none; border:1px solid rgba(120,145,185,.42); border-radius:7px; background:#171b22; box-shadow:0 8px 18px rgba(0,0,0,.32); padding:4px; }
-    .h3e-menu.open { display:block; }
-    .h3e-menu-keyhint { position:sticky; top:0; z-index:2; margin:-4px -4px 3px; padding:5px 8px; border-bottom:1px solid rgba(120,145,185,.18); background:#171b22; color:#7f8da3; font-size:9.5px; line-height:1.2; }
+    .h3e-menu { position:relative; z-index:4; flex:0 0 auto; width:100%; height:220px; min-height:220px; max-height:220px; box-sizing:border-box; overflow:hidden; display:none; grid-template-rows:minmax(0,1fr) 46px; border:1px solid rgba(120,145,185,.42); border-radius:7px; background:#171b22; box-shadow:0 6px 14px rgba(0,0,0,.24); }
+    .h3e-menu.open { display:grid; }
+    .h3e-menu-scroll { min-height:0; overflow-y:auto; overflow-x:hidden; padding:4px 4px 8px; scrollbar-gutter:stable; scroll-padding-block:4px 8px; }
     .h3e-menu-group { padding:6px 8px 3px; color:#75839a; font-size:9.5px; font-weight:900; letter-spacing:.09em; text-transform:uppercase; }
-    .h3e-menu-row { width:100%; display:flex; align-items:flex-start; gap:8px; border:0; border-radius:5px; padding:5px 8px; margin:0; text-align:left; color:#dde5f2; background:transparent; cursor:pointer; }
+    .h3e-menu-row { width:100%; min-height:28px; box-sizing:border-box; display:flex; align-items:center; gap:8px; border:0; border-radius:5px; padding:5px 8px; margin:0; text-align:left; color:#dde5f2; background:transparent; cursor:pointer; }
     .h3e-menu-row.selected { background:rgba(81,132,220,.34); box-shadow:inset 3px 0 0 rgba(126,169,255,.9); }
     .h3e-menu-row.is-info { cursor:default; background:rgba(255,255,255,.018); border-left:2px solid rgba(120,145,185,.28); }
     .h3e-menu-row.is-info .h3e-menu-label { color:#aab6c8; }
     .h3e-menu-copy { min-width:0; flex:1; }
-    .h3e-menu-label { display:block; font-weight:800; font-size:11.5px; }
-    .h3e-menu-detail { display:none; margin-top:2px; color:#8e9aab; font-size:10px; line-height:1.35; }
-    .h3e-menu-row.selected .h3e-menu-detail { display:block; }
-    .h3e-menu-insert { display:none; margin-top:3px; max-height:4.2em; overflow:hidden; color:#a6b6cf; font:10px/1.38 ui-monospace,SFMono-Regular,Consolas,monospace; }
-    .h3e-menu-row.selected .h3e-menu-insert { display:block; }
-    .h3e-menu-insert::before { content:"Insert · "; color:#7f91ad; font:900 9.5px/1.38 system-ui,sans-serif; }
+    .h3e-menu-label { display:block; font-weight:800; font-size:11.5px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .h3e-menu-detail, .h3e-menu-insert { display:none; }
+    .h3e-menu-inspector { box-sizing:border-box; height:46px; min-height:46px; overflow:hidden; padding:5px 8px; border-top:1px solid rgba(120,145,185,.24); color:#8e9aab; background:rgba(8,10,14,.28); }
+    .h3e-menu-inspector-detail { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:10px; line-height:1.35; }
+    .h3e-menu-inspector-insert { margin-top:3px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:#a6b6cf; font:9.5px/1.35 ui-monospace,SFMono-Regular,Consolas,monospace; }
+    .h3e-menu-inspector-insert::before { content:"Insert · "; color:#7f91ad; font:900 9px/1.35 system-ui,sans-serif; }
     .h3e-ref-thumb { flex:0 0 38px; width:38px; height:38px; box-sizing:border-box; object-fit:cover; border-radius:5px; border:1px solid rgba(126,145,176,.26); background:#0d1015; }
     .h3e-ref-badge { display:flex; align-items:center; justify-content:center; font:900 11px/1 system-ui,sans-serif; color:#9fb9e7; }
     .h3e-ref-badge.is-audio { color:#c5a7ff; }
@@ -525,8 +674,141 @@ function injectStyles() {
 
 function canonicalLegacyMode(value) {
   const text = String(value ?? "").toLowerCase();
-  if (/audio[- ]?first|audio only|t2a|a2a|v2a/i.test(text)) return MODE_AUDIO;
+  if (/audio[- ]?first|audio only|t2a|r2a|i2a|v2a|a2a/i.test(text)) return MODE_AUDIO;
   return MODE_VIDEO;
+}
+
+function preserveLegacyModelSelection(workflow) {
+  let preserved = 0;
+  pendingLegacyModels.clear();
+  const workflowNodes = workflow?.nodes || [];
+  const inputsFor = (node) => Array.isArray(node?.inputs) ? node.inputs : [];
+  const nodesById = new Map(workflowNodes.map((node) => [String(node?.id), node]));
+  const workflowLinks = Array.isArray(workflow?.links) ? workflow.links : Object.values(workflow?.links || {});
+  const linkById = (id) => workflowLinks.find((link) => String(Array.isArray(link) ? link[0] : link?.id) === String(id));
+  const inputLeaf = (input) => String(input?.name ?? "").split(/[.:/]/).at(-1) || "";
+  const workflowSourceNodeForInput = (input) => {
+    const visitedNodes = new Set();
+    let linkId = input?.link;
+    while (linkId != null) {
+      const link = linkById(linkId);
+      const originId = Array.isArray(link) ? link[1] : link?.origin_id ?? link?.origin_node_id ?? link?.originNodeId;
+      if (originId == null || visitedNodes.has(String(originId))) return null;
+      visitedNodes.add(String(originId));
+      const origin = nodesById.get(String(originId));
+      if (!origin || !/reroute/i.test(String(origin.type ?? ""))) return origin || null;
+      const upstreamInput = inputsFor(origin).find((candidate) => candidate?.link != null);
+      linkId = upstreamInput?.link;
+    }
+    return null;
+  };
+  const serializedWidgetValue = (node, suffix) => {
+    if (!Array.isArray(node?.widgets_values)) return undefined;
+    let widgetIndex = 0;
+    for (const input of inputsFor(node)) {
+      if (!input?.widget) continue;
+      const matches = widgetNameMatches(input?.name, suffix) || widgetNameMatches(input?.widget?.name, suffix);
+      const value = node.widgets_values[widgetIndex];
+      widgetIndex += 1;
+      if (matches) return value;
+    }
+    return undefined;
+  };
+  const connectionModel = (node) => inputsFor(node).some((input) => (
+    input?.link != null && /^(?:ref_image|ref_video|ref_video_audio|ref_audio)_\d+$/.test(inputLeaf(input))
+  )) ? CONDITIONING_MODEL_REF2VA : CONDITIONING_MODEL_FL2VA;
+  const hasConcreteAudioProvision = (node, modeValue) => {
+    if (!LEGACY_AUDIO_MODES.has(String(modeValue ?? ""))) return false;
+    const bundleInput = inputsFor(node).find((input) => widgetNameMatches(input?.name, "h3_bundle"));
+    if (bundleInput?.link == null) return false;
+    const loader = workflowSourceNodeForInput(bundleInput);
+    if (loader?.type !== "MiniMaxH3EasyLoader") return false;
+    const audioInput = inputsFor(loader).find((input) => widgetNameMatches(input?.name, "audio_model") || widgetNameMatches(input?.widget?.name, "audio_model"));
+    if (!audioInput) return false;
+    const value = String(serializedWidgetValue(loader, "audio_model") ?? "").trim();
+    if (!value || /^(?:auto|none|disabled|follow|same\b|no\s+(?:separate\s+)?audio)/i.test(value)) return false;
+    return true;
+  };
+
+  for (const node of workflowNodes) {
+    if (![NODE_CLASS, "MiniMaxH3EasyV3", "MiniMaxH3EasyV2", "MiniMaxH3Easy"].includes(node?.type)) continue;
+    const modeValue = Array.isArray(node.widgets_values) ? node.widgets_values[0] : null;
+    const modelInput = inputsFor(node).find((input) => widgetNameMatches(input?.name, "conditioning_model"));
+    const serializedModel = modelInput ? String(serializedWidgetValue(node, "conditioning_model") ?? "") : "";
+    const hasSerializedModel = Boolean(modelInput && serializedModel);
+    const previousConnectionModel = connectionModel(node);
+
+    let selection = hasConcreteAudioProvision(node, modeValue) ? REMOVED_AUDIO_MODEL : legacyModelSelection(modeValue);
+    if (node?.type === NODE_CLASS && hasSerializedModel) {
+      const canonicalModel = canonicalWidgetValue("conditioning_model", serializedModel);
+      if ([CONDITIONING_MODEL_FL2VA, CONDITIONING_MODEL_REF2VA].includes(canonicalModel)) continue;
+      if (canonicalModel !== REMOVED_AUDIO_MODEL) continue;
+      selection = REMOVED_AUDIO_MODEL;
+    } else if (!selection) {
+      selection = previousConnectionModel;
+    }
+    if (!selection) continue;
+    pendingLegacyModels.set(node.id, selection);
+    preserved += 1;
+  }
+  return preserved;
+}
+
+function migrateRemovedAudioModelInput(workflow) {
+  let migrated = 0;
+  for (const node of workflow?.nodes || []) {
+    if (node?.type !== "MiniMaxH3EasyLoader" || !Array.isArray(node.inputs)) continue;
+    let widgetIndex = 0;
+    let removedWidgetIndex = -1;
+    let removedInputIndex = -1;
+    for (let inputIndex = 0; inputIndex < node.inputs.length; inputIndex += 1) {
+      const input = node.inputs[inputIndex];
+      if (widgetNameMatches(input?.name, "audio_model") || widgetNameMatches(input?.widget?.name, "audio_model")) {
+        removedInputIndex = inputIndex;
+        if (input?.widget) removedWidgetIndex = widgetIndex;
+        break;
+      }
+      if (input?.widget) widgetIndex += 1;
+    }
+    if (removedInputIndex < 0) continue;
+    const removedLinkIds = new Set();
+    if (node.inputs[removedInputIndex]?.link != null) removedLinkIds.add(String(node.inputs[removedInputIndex].link));
+    const linkEntries = Array.isArray(workflow?.links)
+      ? workflow.links.map((link, index) => [String(index), link])
+      : Object.entries(workflow?.links || {});
+    for (const [key, link] of linkEntries) {
+      const targetId = Array.isArray(link) ? link[3] : link?.target_id ?? link?.target_node_id ?? link?.targetNodeId;
+      const targetSlot = Number(Array.isArray(link) ? link[4] : link?.target_slot ?? link?.targetSlot);
+      if (String(targetId) !== String(node.id)) continue;
+      if (targetSlot === removedInputIndex) {
+        removedLinkIds.add(String(Array.isArray(link) ? link[0] : link?.id ?? key));
+      } else if (targetSlot > removedInputIndex) {
+        if (Array.isArray(link)) link[4] = targetSlot - 1;
+        else if (Object.prototype.hasOwnProperty.call(link, "target_slot")) link.target_slot = targetSlot - 1;
+        else if (Object.prototype.hasOwnProperty.call(link, "targetSlot")) link.targetSlot = targetSlot - 1;
+      }
+    }
+    node.inputs.splice(removedInputIndex, 1);
+    if (removedWidgetIndex >= 0 && Array.isArray(node.widgets_values)) node.widgets_values.splice(removedWidgetIndex, 1);
+    if (removedLinkIds.size) {
+      if (Array.isArray(workflow.links)) {
+        workflow.links = workflow.links.filter((link) => !removedLinkIds.has(String(Array.isArray(link) ? link[0] : link?.id)));
+      } else if (workflow.links && typeof workflow.links === "object") {
+        for (const [key, link] of Object.entries(workflow.links)) {
+          if (removedLinkIds.has(String(link?.id ?? key))) delete workflow.links[key];
+        }
+      }
+      for (const source of workflow?.nodes || []) {
+        for (const output of source?.outputs || []) {
+          if (!Array.isArray(output?.links)) continue;
+          const links = output.links.filter((linkId) => !removedLinkIds.has(String(linkId)));
+          output.links = links.length ? links : null;
+        }
+      }
+    }
+    migrated += 1;
+  }
+  return migrated;
 }
 
 function canonicalLegacyRole(value) {
@@ -535,10 +817,12 @@ function canonicalLegacyRole(value) {
 }
 
 function canonicalLegacyRefSize(value) {
+  const aliased = canonicalWidgetValue("ref_image_size", value);
+  if (H3E_VALID.refImageSize.has(aliased)) return aliased;
   const text = String(value ?? "").toLowerCase();
-  return /(?:^|\b)(?:2k|max)(?:\b|$)/.test(text)
-    ? "2048px short-edge cap (no upscale)"
-    : "Balanced to output area (may upscale)";
+  return /(?:^|\b)(?:2k|max|2048)(?:\b|$)/.test(text)
+    ? "Preserve source detail (2048px short-edge cap; slower)"
+    : "Match output area (predictable token cost)";
 }
 
 function migrateRemovedAdvancedSelector(workflow) {
@@ -580,6 +864,53 @@ function migrateRemovedAudioProxyCanvas(workflow) {
     }
   }
   return migrated;
+}
+
+function migrateRemovedCompiledPromptOutput(workflow) {
+  const nodes = workflow?.nodes || [];
+  const easyNodes = nodes.filter((node) => node?.type === NODE_CLASS);
+  if (!easyNodes.length) return 0;
+
+  const easyIds = new Set(easyNodes.map((node) => String(node.id)));
+  const removedLinkIds = new Set();
+  for (const node of easyNodes) {
+    if (!Array.isArray(node.outputs) || node.outputs.length <= 2) continue;
+    for (const output of node.outputs.slice(2)) {
+      for (const linkId of output?.links || []) removedLinkIds.add(String(linkId));
+    }
+    node.outputs = node.outputs.slice(0, 2);
+  }
+
+  const entries = Array.isArray(workflow?.links)
+    ? workflow.links.map((link, index) => [String(index), link])
+    : Object.entries(workflow?.links || {});
+  for (const [key, link] of entries) {
+    const originId = Array.isArray(link) ? link[1] : link?.origin_id ?? link?.origin_node_id ?? link?.originNodeId;
+    const originSlot = Number(Array.isArray(link) ? link[2] : link?.origin_slot ?? link?.originSlot);
+    if (!easyIds.has(String(originId)) || originSlot < 2) continue;
+    const linkId = Array.isArray(link) ? link[0] : link?.id ?? key;
+    removedLinkIds.add(String(linkId));
+  }
+  if (!removedLinkIds.size) return 0;
+
+  if (Array.isArray(workflow.links)) {
+    workflow.links = workflow.links.filter((link) => !removedLinkIds.has(String(Array.isArray(link) ? link[0] : link?.id)));
+  } else if (workflow.links && typeof workflow.links === "object") {
+    for (const [key, link] of Object.entries(workflow.links)) {
+      if (removedLinkIds.has(String(link?.id ?? key))) delete workflow.links[key];
+    }
+  }
+  for (const node of nodes) {
+    for (const input of node?.inputs || []) {
+      if (input?.link != null && removedLinkIds.has(String(input.link))) input.link = null;
+    }
+    for (const output of node?.outputs || []) {
+      if (!Array.isArray(output?.links)) continue;
+      const remaining = output.links.filter((linkId) => !removedLinkIds.has(String(linkId)));
+      output.links = remaining.length ? remaining : null;
+    }
+  }
+  return removedLinkIds.size;
 }
 
 function migrateV2IntentMode(workflow) {
@@ -718,6 +1049,22 @@ function referenceInputLeaf(inputName) {
   return value.split(/[.:/]/).at(-1) || value;
 }
 
+function isAudioReferenceKind(kind) {
+  return kind === "audio" || kind === "soundtrack";
+}
+
+function availableReferenceDescriptors(state) {
+  return [...(state.refs || []), ...(state.videoAudioRefs || [])];
+}
+
+function physicalReferenceDescriptor(state, definition) {
+  return availableReferenceDescriptors(state).find((ref) => ref.kind === definition.kind && ref.ordinal === definition.ordinal) || null;
+}
+
+function referencePreviewType(ref) {
+  return ref?.kind === "soundtrack" ? "audio" : ref?.kind;
+}
+
 function referenceSocketLabel(ref) {
   const inputName = referenceInputLeaf(ref?.inputName);
   return inputName ? `${ref.token} · ${inputName}` : ref.token;
@@ -745,7 +1092,7 @@ function referenceContextDetail(ref, section) {
     if (section === "retention_analysis") return `${base} · retain the defined video-level role.`;
     if (section === "detailed_description") return `${base} · cite where its edit/continuation/structure role applies.`;
   }
-  if (ref.kind === "audio") {
+  if (isAudioReferenceKind(ref.kind)) {
     if (section === "subject_definitions") return `${base} · define copy vs reference role and what it supplies.`;
     if (section === "summary") return `${base} · audio reuse = copied signal; audio reference = guidance only.`;
     if (section === "retention_analysis") return `${base} · fully_copy / partially_copy / reference / weak_reference.`;
@@ -770,7 +1117,7 @@ function referenceContextExample(ref, section) {
     if (section === "retention_analysis") return `${ref.token} (cut and pacing structure): weak_reference - retain the broad cut cadence without copying the source footage.`;
     if (section === "detailed_description") return `The camera movement follows the arc-and-push pattern referenced from ${ref.token}.`;
   }
-  if (ref.kind === "audio") {
+  if (isAudioReferenceKind(ref.kind)) {
     if (section === "subject_definitions") return `${ref.token} is a background-music style reference; its signal is not copied directly.`;
     if (section === "summary") return `[audio reference] The target speaker follows ${ref.token}'s voice timbre without copying the signal.`;
     if (section === "retention_analysis") return `${ref.token}: reference - match the voice timbre and measured delivery without copying the source signal.`;
@@ -789,16 +1136,325 @@ function referenceContextExample(ref, section) {
 function roleOption(ref, label, detail, insertText, group, example = null, selectText = null) {
   return {
     ...insertOption(label, detail, insertText, group, selectText, example),
-    previewType: ref.kind,
+    previewType: referencePreviewType(ref),
     inputName: ref.inputName || null,
     ordinal: ref.ordinal,
   };
 }
 
+function appendSectionText(prompt, section, nextSection, text, separator = "\n") {
+  const source = String(prompt || "");
+  const header = `${section}:`;
+  const start = source.indexOf(header);
+  if (start < 0) return source;
+  const bodyStart = start + header.length;
+  const next = source.indexOf(`\n\n${nextSection}:`, bodyStart);
+  if (next < 0) return source;
+  const body = source.slice(bodyStart, next);
+  const join = body.trim() ? separator : "\n";
+  return `${source.slice(0, next)}${join}${text}${source.slice(next)}`;
+}
+
+function appendFinalSectionText(prompt, section, text, separator = "\n") {
+  const source = String(prompt || "");
+  const header = `${section}:`;
+  const start = source.indexOf(header);
+  if (start < 0) return source;
+  const body = source.slice(start + header.length);
+  const join = body.trim() ? separator : "\n";
+  return `${source}${join}${text}`;
+}
+
+function placeAudioLayerText(prompt, section, text) {
+  const source = String(prompt || "");
+  const scaffold = section === "overall_soundscape"
+    ? "{ambience + physical / non-verbal sounds, or N/A only if completely silent}"
+    : "{audience-only score: instrumentation + tempo/rhythm + dynamic development, or N/A}";
+  if (source.includes(scaffold)) return source.replace(scaffold, text);
+  if (section === "overall_soundscape") return appendSectionText(source, section, "non_diegetic_music", text);
+  return appendFinalSectionText(source, section, text);
+}
+
+function appendFirstShotText(prompt, text) {
+  const source = String(prompt || "");
+  const header = "detailed_description:";
+  const bodyStart = source.indexOf(header);
+  if (bodyStart < 0) return source;
+  const contentStart = bodyStart + header.length;
+  const sectionEnd = source.indexOf("\n\noverall_soundscape:", contentStart);
+  if (sectionEnd < 0) return source;
+  const body = source.slice(contentStart, sectionEnd);
+  const firstShot = /(?:^|\n)[ \t]*\[Shot\s+1\]/i.exec(body);
+  const clause = String(text || "").replace(/^\s*\[Shot\s+1\]\s*/i, "").trim();
+  if (!clause) return source;
+  if (!firstShot) return appendSectionText(source, "detailed_description", "overall_soundscape", `[Shot 1] ${clause}`);
+  const afterFirstShot = firstShot.index + firstShot[0].length;
+  const laterShot = /\n[ \t]*\[Shot\s+(?:[2-9]\d*|1\d+)\]/i.exec(body.slice(afterFirstShot));
+  const firstShotEnd = laterShot ? afterFirstShot + laterShot.index : body.length;
+  let field = null;
+  let fieldIndex = -1;
+  for (const candidate of [
+    "{action in playback order}",
+    "{audio events in playback order}",
+    "{synchronized sound / dialogue if present}",
+  ]) {
+    const candidateIndex = body.indexOf(candidate, afterFirstShot);
+    if (candidateIndex >= 0 && candidateIndex < firstShotEnd) {
+      field = candidate;
+      fieldIndex = candidateIndex;
+      break;
+    }
+  }
+  if (field) {
+    const insertion = contentStart + fieldIndex;
+    return `${source.slice(0, insertion)}${clause} ${field}${source.slice(insertion + field.length)}`;
+  }
+  const insertion = laterShot
+    ? contentStart + afterFirstShot + laterShot.index
+    : sectionEnd;
+  return `${source.slice(0, insertion)}\n${clause}${source.slice(insertion)}`;
+}
+
+function replaceFirstShotActionText(prompt, text) {
+  const source = String(prompt || "");
+  const clause = String(text || "").replace(/^\s*\[Shot\s+1\]\s*/i, "").trim();
+  if (!clause) return source;
+  const header = "detailed_description:";
+  const bodyStart = source.indexOf(header);
+  if (bodyStart < 0) return source;
+  const contentStart = bodyStart + header.length;
+  const sectionEnd = source.indexOf("\n\noverall_soundscape:", contentStart);
+  if (sectionEnd < 0) return source;
+  const body = source.slice(contentStart, sectionEnd);
+  const firstShot = /(?:^|\n)[ \t]*\[Shot\s+1\]/i.exec(body);
+  if (!firstShot) return appendFirstShotText(source, text);
+  const afterFirstShot = firstShot.index + firstShot[0].length;
+  const laterShot = /\n[ \t]*\[Shot\s+(?:[2-9]\d*|1\d+)\]/i.exec(body.slice(afterFirstShot));
+  const firstShotEnd = laterShot ? afterFirstShot + laterShot.index : body.length;
+  const field = "{action in playback order}";
+  const fieldIndex = body.indexOf(field, afterFirstShot);
+  if (fieldIndex < 0 || fieldIndex >= firstShotEnd) return appendFirstShotText(source, text);
+  const start = contentStart + fieldIndex;
+  const fieldEnd = start + field.length;
+  const end = /[.!?]$/.test(clause) && source[fieldEnd] === "." ? fieldEnd + 1 : fieldEnd;
+  return source.slice(0, start) + clause + source.slice(end);
+}
+
+function addSummaryTask(prompt, task) {
+  const source = String(prompt || "");
+  if (source.includes("{summary task type}")) return source.replace("{summary task type}", task);
+  const match = source.match(/(summary:\s*\n\s*)\[([^\]\n]+)\]/i);
+  if (!match) return source;
+  const tasks = match[2].split("+").map((value) => value.trim()).filter(Boolean);
+  if (tasks.includes(task)) return source;
+  const replacement = `${match[1]}[${[...tasks, task].join(" + ")}]`;
+  return source.slice(0, match.index) + replacement + source.slice((match.index || 0) + match[0].length);
+}
+
+function relationshipBundlePrompt(prompt, placeholder, spec) {
+  const source = String(prompt || "");
+  let result = source.slice(0, placeholder.start)
+    + `${spec.definition}\n{define tracked reference content}`
+    + source.slice(placeholder.end);
+  result = addSummaryTask(result, spec.task);
+  if (result.includes("{target video + main reference relationships}")) {
+    result = result.replace("{target video + main reference relationships}", spec.summary);
+  } else {
+    result = appendSectionText(result, "summary", "retention_analysis", spec.summary, " ");
+  }
+  if (result.includes("{retention rows for tracked references}")) {
+    result = result.replace("{retention rows for tracked references}", `${spec.retention}\n{retention rows for tracked references}`);
+  } else {
+    result = appendSectionText(result, "retention_analysis", "detailed_description", spec.retention);
+  }
+  if (spec.detailed) {
+    result = spec.replaceAction
+      ? replaceFirstShotActionText(result, spec.detailed)
+      : appendFirstShotText(result, spec.detailed);
+  }
+  if (spec.soundscape) result = placeAudioLayerText(result, "overall_soundscape", spec.soundscape);
+  if (spec.music) result = placeAudioLayerText(result, "non_diegetic_music", spec.music);
+  return result;
+}
+
+function relationshipBundleOption(ref, prompt, placeholder, spec) {
+  return {
+    ...roleOption(ref, spec.label, spec.detail, spec.definition, `Relationship builder - ${ref.token}`, spec.example, spec.select),
+    replacePrompt: relationshipBundlePrompt(prompt, placeholder, spec),
+  };
+}
+
+function referenceRelationshipBundleOptions(state, prompt, placeholder) {
+  if (state.editorProfile !== PROFILE.REF2VA) return [];
+  const subject = `@Subject${nextSubjectOrdinal(prompt)}`;
+  const tracked = new Set(standaloneDefinitions(prompt).map((definition) => `${definition.kind}:${definition.ordinal}`));
+  const options = [];
+  for (const ref of availableReferenceDescriptors(state)) {
+    const alreadyTracked = tracked.has(`${ref.kind}:${ref.ordinal}`);
+    if (ref.kind === "image") {
+      options.push(relationshipBundleOption(ref, prompt, placeholder, {
+        label: `${ref.token} / subject identity bundle`,
+        detail: "Use the Picture as provenance for a reusable Subject and fill matching Reference sections.",
+        definition: `${subject} is {tracked subject} shown in ${ref.token}; ${ref.token} provides {source contribution}.`,
+        task: "reference generation",
+        summary: `The target video keeps ${subject}'s defined identity while depicting {overall action / premise}.`,
+        retention: `${subject} (appears in [Shot 1]): fully_preserved - preserve {identity / appearance / structure to keep}.`,
+        detailed: `[Shot 1] ${subject}'s target motion follows {action / motion performance}, while the defined identity and appearance remain consistent.`,
+        replaceAction: true,
+        example: `${subject} is the woman shown in ${ref.token}; ${ref.token} provides her face, hair, clothing, and proportions.`,
+        select: "{tracked subject}",
+      }));
+      if (alreadyTracked) continue;
+      options.push(relationshipBundleOption(ref, prompt, placeholder, {
+        label: `${ref.token} / first-frame bundle`,
+        detail: "Track the Picture as a concrete opening frame and fill keyframe-completion relationships.",
+        definition: `${ref.token} is the first frame of [Shot 1], showing {subject / scene / composition}.`,
+        task: "keyframe completion",
+        summary: `The target video begins from ${ref.token} and depicts {overall action / premise}.`,
+        retention: `${ref.token} ([Shot 1] first frame): fully_preserved - preserve {identity / appearance / structure to keep}.`,
+        detailed: `[Shot 1] The shot begins from ${ref.token}; {action onset}. {continuous development}.`,
+        replaceAction: true,
+        example: `${ref.token} is the first frame of [Shot 1], showing the subject beside a rain-covered window.`,
+        select: "{subject / scene / composition}",
+      }));
+      options.push(relationshipBundleOption(ref, prompt, placeholder, {
+        label: `${ref.token} / last-frame bundle`,
+        detail: "Track the Picture as the concrete final frame and scaffold convergence toward it.",
+        definition: `${ref.token} is the last frame of [Shot 1], showing {final pose / state / composition}.`,
+        task: "keyframe completion",
+        summary: `The target video progresses toward ${ref.token} as its final frame while depicting {overall action / premise}.`,
+        retention: `${ref.token} ([Shot 1] last frame): fully_preserved - preserve {identity / appearance / structure to keep}.`,
+        detailed: `[Shot 1] {state before the final frame}. {motion toward the final frame}. {final-frame convergence}, landing on ${ref.token}.`,
+        replaceAction: true,
+        example: `${ref.token} is the last frame of [Shot 1], showing the subject holding an open umbrella.`,
+        select: "{final pose / state / composition}",
+      }));
+    } else if (ref.kind === "video" && !alreadyTracked) {
+      options.push(relationshipBundleOption(ref, prompt, placeholder, {
+        label: `${ref.token} / direct-edit bundle`,
+        detail: "Use the source video itself as the footage being edited.",
+        definition: `${ref.token} is the source video for the target video edit.`,
+        task: "video editing",
+        summary: `The target video is an edited version of ${ref.token} and depicts {overall action / premise}.`,
+        retention: `${ref.token}: partially_preserved - keep {features retained}; change {features changed}.`,
+        detailed: `[Shot 1] The edit follows ${ref.token}'s source timeline. {action in playback order}.`,
+        replaceAction: true,
+        example: `${ref.token} is the source video for the target edit; preserve its timing while replacing the background.`,
+        select: "{features retained}",
+      }));
+      options.push(relationshipBundleOption(ref, prompt, placeholder, {
+        label: `${ref.token} / continuation bundle`,
+        detail: "Continue from the source video's ending state.",
+        definition: `${ref.token} is the source video whose ending state is continued by the target video.`,
+        task: "video continuation",
+        summary: `The target video continues from ${ref.token}'s ending state while depicting {overall action / premise}.`,
+        retention: `${ref.token}: fully_preserved - preserve {identity / appearance / structure to keep} at the continuation boundary.`,
+        detailed: `[Shot 1] The target continues from ${ref.token}'s ending state; {action / motion performance} guides the new target motion.`,
+        replaceAction: true,
+        example: `${ref.token} ends with the subject facing a doorway; the target continues from that exact state.`,
+        select: "{overall action / premise}",
+      }));
+      options.push(relationshipBundleOption(ref, prompt, placeholder, {
+        label: `${ref.token} / camera-temporal bundle`,
+        detail: "Reference camera movement, cuts, rhythm, pacing, or whole-video temporal structure without editing the footage.",
+        definition: `${ref.token} is referenced for its camera movement, cuts, rhythm, pacing, and temporal structure.`,
+        task: "reference generation",
+        summary: `The target video follows ${ref.token}'s camera and temporal structure while depicting {overall action / premise}.`,
+        retention: `${ref.token}: weak_reference - retain broad similarity in {camera movement / cut cadence / pacing / temporal structure}.`,
+        detailed: `[Shot 1] The target follows the camera movement and temporal structure referenced from ${ref.token}; {action / motion performance} guides the target action.`,
+        replaceAction: true,
+        example: `${ref.token} provides a slow arc, short push-in, and slow-fast-slow cut rhythm without supplying target footage.`,
+        select: "{overall action / premise}",
+      }));
+    } else if (isAudioReferenceKind(ref.kind) && !alreadyTracked) {
+      options.push(relationshipBundleOption(ref, prompt, placeholder, {
+        label: `${ref.token} / full-signal-reuse bundle`,
+        detail: "Copy the complete source signal unchanged as the final audio track and cite where it takes effect.",
+        definition: `${ref.token} is the reference audio whose complete signal is reused unchanged as the target video's final audio track.`,
+        task: "audio reuse",
+        summary: `The target video's audio fully reuses ${ref.token} as its complete final track while the video depicts {overall action / premise}.`,
+        retention: `${ref.token}: fully_copy - reuse the complete signal unchanged as the final audio track.`,
+        detailed: `[Shot 1] Throughout the target video, ${ref.token} supplies the complete final audio signal unchanged and remains synchronized to target playback.`,
+        example: `${ref.token} is reused unchanged as the complete final audio track for the target video.`,
+        select: "{overall action / premise}",
+      }));
+      options.push(relationshipBundleOption(ref, prompt, placeholder, {
+        label: `${ref.token} / partial reuse - timeline or vocals`,
+        detail: "Copy a synchronized event, vocal layer, or timeline segment and cite the target phase where it plays. Reused words still need exact <d>[Language] ...</d> content.",
+        definition: `${ref.token} is the reference audio whose selected synchronized event, vocal layer, or timeline segment is reused in the target video.`,
+        task: "audio reuse",
+        summary: `The target video's synchronized audio partially reuses ${ref.token} while the video depicts {overall action / premise}.`,
+        retention: `${ref.token}: partially_copy - reuse {copied segment / layers}; then {what is added / removed / replaced}.`,
+        detailed: `[Shot 1] When {event within the current shot}, the target directly reuses {copied segment / layers} from ${ref.token}; {what is added / removed / replaced}.`,
+        example: `${ref.token} is reused from 0:00-0:04, after which newly generated ambience is introduced.`,
+        select: "{copied segment / layers}",
+      }));
+      options.push(relationshipBundleOption(ref, prompt, placeholder, {
+        label: `${ref.token} / partial reuse - ambience or SFX`,
+        detail: "Copy only ambience or physical-sound layers and state that relationship in overall_soundscape.",
+        definition: `${ref.token} is the reference audio whose {copied segment / layers} are ambience or physical-sound layers partially reused in the target video.`,
+        task: "audio reuse",
+        summary: `The target video's ambience and physical sounds partially reuse ${ref.token} while the video depicts {overall action / premise}.`,
+        retention: `${ref.token}: partially_copy - reuse {copied segment / layers}; then {what is added / removed / replaced}.`,
+        soundscape: `The {copied segment / layers} from ${ref.token} remain active in the target soundscape; {what is added / removed / replaced}.`,
+        example: `${ref.token}'s steady room tone is copied throughout, while new footsteps are added for the target action.`,
+        select: "{copied segment / layers}",
+      }));
+      options.push(relationshipBundleOption(ref, prompt, placeholder, {
+        label: `${ref.token} / partial reuse - audience score`,
+        detail: "Copy only an audience-only score segment or layer and state that relationship in non_diegetic_music.",
+        definition: `${ref.token} is the reference audio whose {copied segment / layers} are an audience-only score segment or layer partially reused in the target video.`,
+        task: "audio reuse",
+        summary: `The target video's audience-only score partially reuses ${ref.token} while the video depicts {overall action / premise}.`,
+        retention: `${ref.token}: partially_copy - reuse {copied segment / layers}; then {what is added / removed / replaced}.`,
+        music: `The audience-only score copies ${ref.token}'s {copied segment / layers}; {what is added / removed / replaced}.`,
+        example: `${ref.token}'s opening piano phrase is copied for the first four seconds, then new low strings enter.`,
+        select: "{copied segment / layers}",
+      }));
+      options.push(relationshipBundleOption(ref, prompt, placeholder, {
+        label: `${ref.token} / reference - voice or timeline`,
+        detail: "Reference timbre, delivery, rhythm, dialogue content, or synchronized sound texture without copying the signal, then cite the target phase where it applies.",
+        definition: `${ref.token} is referenced for {timbre / rhythm / music style / dialogue content / sound texture} without copying its signal.`,
+        task: "audio reference",
+        summary: `The target video's audio follows the defined properties of ${ref.token} without copying its signal while the video depicts {overall action / premise}.`,
+        retention: `${ref.token}: reference - match {timbre / rhythm / music style / dialogue content / sound texture} without copying the source signal.`,
+        detailed: `[Shot 1] When {event within the current shot}, the target audio follows ${ref.token}'s {timbre / rhythm / music style / dialogue content / sound texture} without copying its signal.`,
+        example: `${ref.token} is referenced for the narrator's dry vocal timbre and measured delivery without copying the signal.`,
+        select: "{timbre / rhythm / music style / dialogue content / sound texture}",
+      }));
+      options.push(relationshipBundleOption(ref, prompt, placeholder, {
+        label: `${ref.token} / reference - ambience or SFX`,
+        detail: "Reference ambience or physical-sound properties without copying the signal and place the relationship in overall_soundscape.",
+        definition: `${ref.token} is referenced for {timbre / rhythm / music style / dialogue content / sound texture} as ambience or physical-sound guidance without copying its signal.`,
+        task: "audio reference",
+        summary: `The target video's ambience and physical sounds follow the defined properties of ${ref.token} without copying its signal while the video depicts {overall action / premise}.`,
+        retention: `${ref.token}: reference - match {timbre / rhythm / music style / dialogue content / sound texture} without copying the source signal.`,
+        soundscape: `The target ambience and physical sounds follow ${ref.token}'s {timbre / rhythm / music style / dialogue content / sound texture} without copying the source signal.`,
+        example: `${ref.token} guides the close, dry room tone and sparse metallic impacts without copying the original signal.`,
+        select: "{timbre / rhythm / music style / dialogue content / sound texture}",
+      }));
+      options.push(relationshipBundleOption(ref, prompt, placeholder, {
+        label: `${ref.token} / reference - audience score`,
+        detail: "Reference audience-only music properties without copying the signal and place the relationship in non_diegetic_music.",
+        definition: `${ref.token} is referenced for audience-only score properties: {instruments / sound sources}, {tempo / rhythm}, and {dynamic change}, without copying its signal.`,
+        task: "audio reference",
+        summary: `The target video's audience-only score follows the defined properties of ${ref.token} without copying its signal while the video depicts {overall action / premise}.`,
+        retention: `${ref.token}: reference - match {instruments / sound sources}, {tempo / rhythm}, and {dynamic change} without copying the source signal.`,
+        music: `The audience-only score follows ${ref.token}'s {instruments / sound sources}, {tempo / rhythm}, and {dynamic change} without copying the source signal.`,
+        example: `${ref.token} guides sparse piano, slow tempo, and a gradual low-string swell without copying the original signal.`,
+        select: "{instruments / sound sources}",
+      }));
+    }
+  }
+  return options;
+}
+
 function referenceRoleVariants(ref, prompt) {
   const group = `Define ${ref.token}`;
   if (ref.kind === "image") {
+    const subject = `@Subject${nextSubjectOrdinal(prompt)}`;
     return [
+      roleOption(ref, `${ref.token} · define ${subject}`, "Use this Picture as provenance for reusable visible content; track the content as a Subject rather than treating the source as a frame.", `${subject} is {tracked subject} shown in ${ref.token}; ${ref.token} provides {source contribution}.`, group, `${subject} is the woman shown in ${ref.token}; ${ref.token} provides her face, hair, clothing, and proportions.`, "{tracked subject}"),
       roleOption(ref, `${ref.token} · first frame`, "Concrete opening frame; not mere Subject provenance.", `${ref.token} is the first frame of [Shot 1], showing {subject / scene / composition}.`, group, `${ref.token} is the first frame of [Shot 1], showing @Subject1 seated beside a rain-covered window.`, "{subject / scene / composition}"),
       roleOption(ref, `${ref.token} · keyframe`, "Concrete intermediate frame anchor.", `${ref.token} is a keyframe of [Shot 1], showing {pose / composition / state}.`, group, `${ref.token} is a keyframe of [Shot 1], establishing @Subject1 mid-turn with the doorway centered behind her.`, "{pose / composition / state}"),
       roleOption(ref, `${ref.token} · last frame`, "Concrete ending frame; motion lands on it.", `${ref.token} is the last frame of [Shot 1], showing {final pose / state / composition}.`, group, `${ref.token} is the last frame of [Shot 1], showing the umbrella fully open above @Subject1.`, "{final pose / state / composition}"),
@@ -808,14 +1464,16 @@ function referenceRoleVariants(ref, prompt) {
     ];
   }
   if (ref.kind === "video") {
+    const subject = `@Subject${nextSubjectOrdinal(prompt)}`;
     return [
+      roleOption(ref, `${ref.token} · define ${subject}`, "Use visible content from this Video as provenance for a reusable Subject; use the Video itself only for edit, continuation, camera, cut, rhythm, or temporal roles.", `${subject} is {tracked subject} shown in ${ref.token}; ${ref.token} provides {source contribution}.`, group, `${subject} is the performer shown in ${ref.token}; ${ref.token} provides appearance, clothing, and movement details.`, "{tracked subject}"),
       roleOption(ref, `${ref.token} · direct edit`, "Source video itself is modified.", `${ref.token} is the source video for the target video edit.`, group, `${ref.token} is the source video for the target edit; preserve its timing while replacing the background.`),
       roleOption(ref, `${ref.token} · continuation`, "Target continues from the source ending state.", `${ref.token} is the source video whose ending state is continued by the target video.`, group, `${ref.token} ends with @Subject1 facing the doorway; the target continues from that exact state.`),
       roleOption(ref, `${ref.token} · camera movement`, "Use source camera motion as guidance.", `${ref.token} is referenced for its camera movement, which guides the target video's camera behavior.`, group, `${ref.token} is referenced for its slow arc followed by a short push-in; the target uses that camera pattern with new content.`),
       roleOption(ref, `${ref.token} · cuts / rhythm / temporal structure`, "Use source cuts, pacing or temporal structure as guidance.", `${ref.token} is referenced for its cuts, rhythm, pacing, and temporal structure, which guide the target video.`, group, `${ref.token} is referenced for a three-shot slow-fast-slow pacing structure without copying its footage.`),
     ];
   }
-  if (ref.kind === "audio") {
+  if (isAudioReferenceKind(ref.kind)) {
     const speakerIds = [...knownSpeakerIds(prompt)].sort((a, b) => a - b);
     const subjectBindings = knownSubjectSpeakerBindings(prompt);
     const options = [
@@ -897,7 +1555,7 @@ function subjectReferenceRoleVariants(ref, state) {
 
 function timelineReferenceFollowupOptions(ref, state, prompt) {
   if (ref.kind === "subject") {
-    return [roleOption(ref, `${ref.token} · action`, "Continue with a target-timeline action sentence.", `${ref.token} performs {action / motion performance}.`, `Use ${ref.token}`, `${ref.token} performs a controlled turn toward the doorway.`, "{action / motion performance}")];
+    return [roleOption(ref, `${ref.token} · action`, "Continue with a target-timeline action sentence.", `The target action for ${ref.token} follows {action / motion performance}.`, `Use ${ref.token}`, `The target action for ${ref.token} follows a controlled turn toward the doorway.`, "{action / motion performance}")];
   }
   if (ref.kind === "image") {
     const anchors = pictureAnchorOptions(state, prompt).filter((option) => String(option.insertText || "").includes(ref.token));
@@ -905,11 +1563,11 @@ function timelineReferenceFollowupOptions(ref, state, prompt) {
   }
   if (ref.kind === "video") {
     return [
-      roleOption(ref, `${ref.token} · camera / temporal guidance`, "Use the video for camera, cuts, rhythm, or temporal structure.", `The target follows the camera movement and temporal structure referenced from ${ref.token} while {action / motion performance}.`, `Use ${ref.token}`, `The target follows the slow arc and cut rhythm referenced from ${ref.token} while the subject crosses the room.`, "{action / motion performance}"),
-      roleOption(ref, `${ref.token} · continuation state`, "Continue naturally from the reference video's ending state.", `The target continues from ${ref.token}'s ending state and then {action / motion performance}.`, `Use ${ref.token}`, `The target continues from ${ref.token}'s ending state and then the subject opens the door.`, "{action / motion performance}"),
+      roleOption(ref, `${ref.token} · camera / temporal guidance`, "Use the video for camera, cuts, rhythm, or temporal structure.", `The target follows the camera movement and temporal structure referenced from ${ref.token}; {action / motion performance} guides the target action.`, `Use ${ref.token}`, `The target follows the slow arc and cut rhythm referenced from ${ref.token}; a controlled crossing of the room guides the target action.`, "{action / motion performance}"),
+      roleOption(ref, `${ref.token} · continuation state`, "Continue naturally from the reference video's ending state.", `The target continues from ${ref.token}'s ending state; {action / motion performance} guides the new target motion.`, `Use ${ref.token}`, `The target continues from ${ref.token}'s ending state; a controlled door-opening performance guides the new target motion.`, "{action / motion performance}"),
     ];
   }
-  if (ref.kind === "audio") {
+  if (isAudioReferenceKind(ref.kind)) {
     const options = [
       roleOption(ref, `${ref.token} · reference properties here`, "Reference timbre, rhythm, music style, dialogue content, or sound texture without direct signal copy.", `${ref.token} is referenced here for {timbre / rhythm / music style / dialogue content / sound texture}.`, `Use ${ref.token}`, `${ref.token} is referenced here for the narrator's dry vocal timbre and measured delivery.`, "{timbre / rhythm / music style / dialogue content / sound texture}"),
       roleOption(ref, `${ref.token} · copied signal audible here`, "State that copied source audio is active in this part of the target timeline.", `The copied signal from ${ref.token} is audible during this part of the shot.`, `Use ${ref.token}`, `The copied signal from ${ref.token} remains audible while the camera crosses the room.`),
@@ -926,30 +1584,67 @@ function endpointImageFollowupOptions(ref, state) {
   if (ref.kind !== "image") return [];
   const aliases = keyframeAliases(state);
   if (state.conditioningProfile === PROFILE.I2VA || ref.token === aliases.opening && state.conditioningProfile === PROFILE.FL2VA) {
-    return [roleOption(ref, `${ref.token} · opening-frame continuation`, "Continue from the connected opening frame without redefining it as a Reference asset.", `The shot begins from ${ref.token}; the subject then performs {action / motion performance}.`, `Use ${ref.token}`, `The shot begins from ${ref.token}; the subject then turns toward the doorway.`, "{action / motion performance}")];
+    return [roleOption(ref, `${ref.token} · opening-frame continuation`, "Continue from the connected opening frame without redefining it as a Reference asset.", `The shot begins from ${ref.token}; {action / motion performance} guides the subject's subsequent movement.`, `Use ${ref.token}`, `The shot begins from ${ref.token}; a controlled turn toward the doorway guides the subject's subsequent movement.`, "{action / motion performance}")];
   }
   if (state.conditioningProfile === PROFILE.L2VA || ref.token === aliases.ending && state.conditioningProfile === PROFILE.FL2VA) {
     return [roleOption(ref, `${ref.token} · final-frame convergence`, "Describe motion that lands on the connected final frame.", `The motion progresses toward ${ref.token} as the final frame, with {motion toward the final frame}.`, `Use ${ref.token}`, `The motion progresses toward ${ref.token} as the final frame, with the subject lowering into the supplied final pose.`, "{motion toward the final frame}")];
   }
-  return [roleOption(ref, `${ref.token} · keyframe anchor`, "Use the connected endpoint image as a concrete frame anchor.", `The shot uses ${ref.token} as a concrete frame anchor, preserving {subject / scene / composition}.`, `Use ${ref.token}`, `The shot uses ${ref.token} as a concrete frame anchor, preserving the supplied pose and framing.`, "{subject / scene / composition}")];
+  return [roleOption(ref, `${ref.token} · keyframe anchor`, "Use the connected first/last frame as a concrete frame anchor.", `The shot uses ${ref.token} as a concrete frame anchor, preserving {subject / scene / composition}.`, `Use ${ref.token}`, `The shot uses ${ref.token} as a concrete frame anchor, preserving the supplied pose and framing.`, "{subject / scene / composition}")];
 }
 
-function referenceFollowupOptions(ref, state, prompt, section) {
+function referencePromptDefinitionOptions(ref, state, prompt, insertedRange) {
+  const source = String(prompt || "");
+  const start = Math.max(0, Math.min(Number(insertedRange?.start) || 0, source.length));
+  const end = Math.max(start, Math.min(Number(insertedRange?.end) || start, source.length));
+  const draft = `${source.slice(0, start)}${source.slice(end)}`.trim();
+  const templateState = starterTemplateState(state, PROFILE.REF2VA, state.audioMode, 0, KEYFRAME_FIRST, state.audioStarterTask);
+  const initial = templateForState(templateState, draft);
+  const template = draft ? wrappedStarterTemplate(initial, PROFILE.REF2VA, state.audioMode, draft, "detailed") : initial;
+  const roles = ref.kind === "subject" ? subjectReferenceRoleVariants(ref, state) : referenceRoleVariants(ref, source);
+  return roles.map((role) => {
+    const definition = `${role.insertText}\n{define tracked reference content}`;
+    return {
+      ...role,
+      label: `Start Reference prompt · ${role.label}`,
+      detail: `${role.detail} ${draft ? "The surrounding draft becomes the first target-timeline shot." : "A complete editable Reference structure is created."}`,
+      replacePrompt: replaceTemplateSectionBody(template, "subject_definitions", "summary", definition),
+      selectText: role.selectText || firstEditorPlaceholder(role.insertText) || firstEditorPlaceholder(definition),
+    };
+  });
+}
+
+function referenceFollowupOptions(ref, state, prompt, section, insertedRange = null) {
   const keep = insertOption(`Keep ${ref.token} only`, "Leave only the reference label and continue typing manually.", ref.token, "Reference label");
+  if (!section) {
+    if (state.conditioningProfile === PROFILE.REF2VA) {
+      return [
+        infoOption("Define this reference in a complete prompt", "Choose a role below. Easy creates the six Reference sections, puts the definition in subject_definitions:, and keeps any surrounding draft in the target timeline.", "Reference placement"),
+        ...referencePromptDefinitionOptions(ref, state, prompt, insertedRange),
+        keep,
+      ];
+    }
+    const detail = state.editorProfile === PROFILE.REF2VA
+      ? "Reference definitions belong inside subject_definitions:. Start or wrap with a Reference template before defining this label."
+      : "Base grammar has no definition preamble. Start or wrap with a Base template, then use this label inside integrated_multimodal_description:.";
+    return [infoOption("Choose where the reference belongs", detail, "Reference placement"), keep];
+  }
+  if (state.editorProfile === PROFILE.REF2VA && section === "subject_definitions") {
+    const roles = (ref.kind === "subject" ? subjectReferenceRoleVariants(ref, state) : referenceRoleVariants(ref, prompt)).map((option) => ({
+      ...option,
+      insertText: `${option.insertText}\n{define tracked reference content}`,
+    }));
+    return [...roles, keep];
+  }
   if (state.conditioningProfile !== PROFILE.REF2VA) {
     const endpoint = endpointImageFollowupOptions(ref, state);
     return endpoint.length ? [...endpoint, keep] : [keep];
   }
-  if (state.editorProfile === PROFILE.REF2VA && (!section || section === "subject_definitions")) {
-    const roles = ref.kind === "subject" ? subjectReferenceRoleVariants(ref, state) : referenceRoleVariants(ref, prompt);
-    return [...roles, keep];
-  }
   if (section === "retention_analysis") {
-    const field = ref.kind === "audio" ? "{audio retention}" : "{visual retention}";
-    return [roleOption(ref, `${ref.token} · retention row`, "Continue directly into this reference's retention relationship.", `${ref.token}: ${field}`, `Use ${ref.token}`, ref.kind === "audio" ? `${ref.token}: reference - match the defined timbre without copying the signal.` : `${ref.token}: fully_preserved - preserve the defined identity and appearance.`, field), keep];
+    const field = isAudioReferenceKind(ref.kind) ? "{audio retention}" : "{visual retention}";
+    return [roleOption(ref, `${ref.token} · retention row`, "Continue directly into this reference's retention relationship.", `${ref.token}: ${field}`, `Use ${ref.token}`, isAudioReferenceKind(ref.kind) ? `${ref.token}: reference - match the defined timbre without copying the signal.` : `${ref.token}: fully_preserved - preserve the defined identity and appearance.`, field), keep];
   }
   if (section === "overall_soundscape" || section === "non_diegetic_music") {
-    const audioOptions = ref.kind === "audio" ? audioLayerReferenceOptions(state, prompt, section).filter((option) => String(option.insertText || "").includes(ref.token)) : [];
+    const audioOptions = isAudioReferenceKind(ref.kind) ? audioLayerReferenceOptions(state, prompt, section).filter((option) => String(option.insertText || "").includes(ref.token)) : [];
     return audioOptions.length ? [...audioOptions, keep] : [keep];
   }
   if (section === timelineSection(state)) {
@@ -967,9 +1662,9 @@ function referenceOptions(state, prompt, query = "", section = null) {
   // pictures/videos from being suggested later as if they were tracked labels.
   if (state.editorProfile === PROFILE.REF2VA && section && section !== "subject_definitions") {
     let definitions = standaloneDefinitions(prompt);
-    if (["overall_soundscape", "non_diegetic_music"].includes(section)) definitions = definitions.filter((definition) => definition.kind === "audio");
+    if (["overall_soundscape", "non_diegetic_music"].includes(section)) definitions = definitions.filter((definition) => isAudioReferenceKind(definition.kind));
     return definitions.map((definition) => {
-      const physical = state.refs.find((ref) => ref.kind === definition.kind && ref.ordinal === definition.ordinal);
+      const physical = physicalReferenceDescriptor(state, definition);
       const ref = {
         token: definition.token,
         kind: definition.kind,
@@ -979,7 +1674,7 @@ function referenceOptions(state, prompt, query = "", section = null) {
       };
       return {
         ...insertOption(referenceSocketLabel(ref), referenceContextDetail(ref, section), ref.token, "Defined references", null, referenceContextExample(ref, section)),
-        previewType: ref.kind,
+        previewType: referencePreviewType(ref),
         inputName: ref.inputName,
         ordinal: ref.ordinal,
         referenceRef: ref,
@@ -987,9 +1682,9 @@ function referenceOptions(state, prompt, query = "", section = null) {
     });
   }
 
-  const options = state.refs.map((ref) => ({
+  const options = availableReferenceDescriptors(state).map((ref) => ({
     ...insertOption(referenceSocketLabel(ref), referenceContextDetail(ref, section), ref.token, "Connected references", null, referenceContextExample(ref, section)),
-    previewType: ref.kind,
+    previewType: referencePreviewType(ref),
     inputName: ref.inputName || null,
     ordinal: ref.ordinal,
     referenceRef: ref,
@@ -1137,15 +1832,17 @@ function cameraSpeedOptions() {
 }
 
 function cutTransitionOptions() {
+  // Ordinary cut wording is copied from MiniMax's base prompt guide. Explicit
+  // transition effects are offered only as deliberate alternatives.
   return [
-    insertOption("Camera cuts", "Ordinary cut; use camera motion for only a slight angle/distance change.", "the camera cuts to", "Ordinary cuts"),
-    insertOption("Image cuts", "Ordinary cut without repeating “shot … new shot” in the generated sentence.", "the image cuts to", "Ordinary cuts"),
-    insertOption("Image transitions", "Ordinary transition wording.", "the image transitions to", "Ordinary cuts"),
-    insertOption("View changes", "Ordinary cut phrased without repeating “shot”.", "the view changes to", "Ordinary cuts"),
-    insertOption("View switches", "Ordinary cut phrased without repeating “shot”.", "the view switches to", "Ordinary cuts"),
-    insertOption("Cross-dissolve", "Use only when that transition is explicitly intended.", "the image cross-dissolves to", "Explicit transitions"),
-    insertOption("Fade", "Use only when that transition is explicitly intended.", "the image fades to", "Explicit transitions"),
-    insertOption("Wipe", "Use only when that transition is explicitly intended.", "a wipe reveals", "Explicit transitions"),
+    insertOption("Camera cuts", "Use for an ordinary hard cut into a new shot. Do not use for camera motion inside one continuous shot.", "the camera cuts to", "Ordinary shot changes"),
+    insertOption("Shot cuts", "Use for an ordinary hard cut into a new shot. Do not use for reframing inside the current shot.", "the shot cuts to", "Ordinary shot changes"),
+    insertOption("Shot transitions", "Use for a neutral new-shot change when no visible transition effect needs to be specified.", "the shot transitions to", "Ordinary shot changes"),
+    insertOption("Shot changes", "Use for a neutral new-shot change when the exact edit wording is unimportant.", "the shot changes to", "Ordinary shot changes"),
+    insertOption("Shot switches", "Use for a direct switch into a new shot, without implying a dissolve, fade, or wipe.", "the shot switches to", "Ordinary shot changes"),
+    insertOption("Cross-dissolve", "Use only when the two shots should visibly overlap and blend during the transition.", "the shot cross-dissolves to", "Visible transition effects"),
+    insertOption("Fade", "Use only when the image should visibly fade out, fade in, or pass through a blank field.", "the shot fades to", "Visible transition effects"),
+    insertOption("Wipe", "Use only when a moving boundary should visibly replace one shot with the next.", "a wipe reveals", "Visible transition effects"),
   ];
 }
 
@@ -1186,18 +1883,18 @@ function dialogueOptions(state, prompt) {
   options.push(insertOption(`singing · new S${next}`, "Create the next singer ID and establish identity/voice before the lyrics.", singingLine(next, true), "New speaker", "{speaker identity}"));
   options.push(insertOption(`voiceover · new S${next}`, "Create the next off-screen speaker ID and establish its identity/voice.", dialogueLine(next, true, true), "New speaker", "{speaker identity}"));
   options.push(
-    insertOption("scenetrans", "Same utterance continues across a cut.", "<scenetrans>", "Dialogue controls"),
-    insertOption("cutoff", "Speech is truncated by video end.", "<cutoff>", "Dialogue controls"),
+    insertOption("<scenetrans> · same line crosses a cut", "Use only when one line of dialogue or lyrics continues through a shot cut. Put <scenetrans> at the connection point in both dialogue fragments and state that the audio continues seamlessly across the cut.", "<scenetrans>", "Dialogue continuity"),
+    insertOption("<cutoff> · speech cut off by video end", "Use only when the end of the generated video truncates the spoken or sung line. Do not use it for a normal interruption or an ordinary shot cut.", "<cutoff>", "Dialogue continuity"),
   );
-  if (state.editorProfile === PROFILE.REF2VA && state.audioCount > 0) {
-    options.push(insertOption("unclear", "Unintelligible span from referenced source audio.", "[unclear]", "Reference-audio controls"));
+  if (state.editorProfile === PROFILE.REF2VA && (state.audioReferenceCount ?? state.audioCount) > 0) {
+    options.push(insertOption("[unclear] · unintelligible referenced words", "Use only for a span in referenced source audio whose words cannot be understood. It is not a substitute for choosing a dialogue language.", "[unclear]", "Reference-audio controls"));
   }
   return options;
 }
 
 function audioOptions(state, prompt, section = null) {
   // Audio guidance obeys the current section instead of acting as a global bag of audio
-  // snippets. This prevents raw connected @AudioN assets or summary task tags
+  // snippets. This prevents raw connected @AudioN/@VideoAudioN assets or summary task tags
   // from being inserted where the REF grammar does not permit them.
   if (section === "overall_soundscape" || section === "non_diegetic_music") {
     return contextualOptions(section, state, prompt);
@@ -1214,8 +1911,8 @@ function audioOptions(state, prompt, section = null) {
     return [...(diegetic ? [diegetic] : []), ...trackedAudio];
   }
   if (section === "subject_definitions" && state.editorProfile === PROFILE.REF2VA) {
-    return state.refs
-      .filter((ref) => ref.kind === "audio")
+    return availableReferenceDescriptors(state)
+      .filter((ref) => isAudioReferenceKind(ref.kind))
       .flatMap((ref) => [
         {
           ...insertOption(ref.token, `${ref.detail} Define only if the audio has its own tracked role.`, ref.token, "Connected audio references", null, `${ref.token} is a background-music style reference; its signal is not copied directly.`),
@@ -1249,22 +1946,42 @@ function insideDialogue(before) {
   return source.lastIndexOf("<d>") > source.lastIndexOf("</d>");
 }
 
-function dialogueLanguageOption(language, bracketed = true) {
+function dialogueLanguageOption(language, bracketed = true, current = false) {
   const stable = STABLE_DIALOGUE_LANGUAGES.includes(language);
-  const preferred = ["English", "Russian", "Japanese", "Dutch", "French"].includes(language);
+  const quick = ["English", "Russian", "Japanese", "Dutch", "French"].includes(language);
   const value = bracketed ? `[${language}]` : language;
   return insertOption(
     value,
-    stable ? "Stable H3 dialogue language." : "Additional dialogue language; H3 support may vary.",
+    current
+      ? `${language} is the current dialogue-language tag. Choose it to keep the value, or choose any other row to replace it.`
+      : stable ? "MiniMax lists this among H3's stable dialogue languages." : "Additional dialogue language; H3 support may vary.",
     value,
-    preferred ? "Preferred" : (stable ? "H3 stable" : "Additional · support may vary"),
+    current ? "Current language" : (quick ? "Quick language tags" : (stable ? "Other H3 stable languages" : "Additional languages · variable support")),
   );
 }
 
-function languageOptions(query = "") {
+function editableLanguageOption() {
+  return {
+    ...insertOption(
+      "Custom language…",
+      "Type any other language tag. The brackets remain in place while the editable field is selected.",
+      "[{dialogue language}]",
+      "Custom",
+      "{dialogue language}",
+    ),
+    custom: true,
+  };
+}
+
+function languageOptions(query = "", current = "") {
   const q = String(query || "").trim();
-  const languages = DIALOGUE_LANGUAGE_OPTIONS.map((language) => dialogueLanguageOption(language, true));
-  if (!q) return languages;
+  const currentValue = String(current || "").trim();
+  const currentKey = currentValue.toLowerCase();
+  const knownCurrent = DIALOGUE_LANGUAGE_OPTIONS.some((language) => language.toLowerCase() === currentKey);
+  const languages = DIALOGUE_LANGUAGE_OPTIONS.map((language) => dialogueLanguageOption(language, true, Boolean(currentKey && language.toLowerCase() === currentKey)));
+  if (knownCurrent) languages.sort((a, b) => Number(b.group === "Current language") - Number(a.group === "Current language"));
+  else if (currentValue) languages.unshift(insertOption(`[${currentValue}]`, "This is the current custom dialogue-language tag. Choose another row to replace it.", `[${currentValue}]`, "Current language"));
+  if (!q) return [...languages, editableLanguageOption()];
   const matched = filterOptions(languages, q);
   if (!DIALOGUE_LANGUAGE_OPTIONS.some((language) => language.toLowerCase() === q.toLowerCase())) {
     matched.push(insertOption(`[${q}]`, "Custom language tag; H3 support may vary.", `[${q}]`, "Custom language"));
@@ -1281,10 +1998,22 @@ function existingShotOptions(prompt, query = "") {
 function bracketOptions(state, prompt, query, before, section) {
   if (insideDialogue(before) && section === timelineSection(state)) {
     const q = String(query || "").trim();
-    if (state.editorProfile === PROFILE.REF2VA && state.audioCount > 0 && q && "unclear".startsWith(q.toLowerCase())) {
+    const bracketStart = before.lastIndexOf("[");
+    const dialogueStart = before.toLowerCase().lastIndexOf("<d>");
+    const languagePosition = dialogueStart >= 0 && bracketStart >= dialogueStart && /^\s*$/.test(before.slice(dialogueStart + 3, bracketStart));
+    if (languagePosition) {
+      if (q.length >= 3 && "unclear".startsWith(q.toLowerCase())) {
+        return [
+          infoOption("[unclear] is not a language", "Choose the dialogue language here. Put [unclear] only among the spoken words copied from referenced source audio.", "Dialogue language"),
+          ...languageOptions(),
+        ];
+      }
+      return languageOptions(q);
+    }
+    if (state.editorProfile === PROFILE.REF2VA && (state.audioReferenceCount ?? state.audioCount) > 0 && (!q || "unclear".startsWith(q.toLowerCase()))) {
       return [insertOption("[unclear]", "Unintelligible span from referenced source audio.", "[unclear]", "Reference-audio controls")];
     }
-    return languageOptions(q);
+    return [infoOption("No language tag here", "The dialogue language belongs immediately after <d>. [unclear] is available later only for unintelligible words copied from referenced source audio.", "Dialogue controls")];
   }
   if (state.editorProfile === PROFILE.REF2VA && section === "summary") {
     const parts = String(query || "").split("+").map((value) => value.trim());
@@ -1341,9 +2070,9 @@ function speakerOptions(prompt, query, allowNew = true) {
 }
 
 function retentionTriggerOptions(line, query) {
-  const audioOnly = /(?:@Audio\d+\b|<Audio\s+\d+>)/i.test(line) && !/(?:@(Subject|Image|Video)\d+\b|<(?:Subject|Picture|Video)\s+\d+>)/i.test(line);
+  const audioOnly = /(?:@(?:VideoAudio|Audio)\d+\b|<Audio\s+\d+>)/i.test(line) && !/(?:@(Subject|Image|Video)\d+\b|<(?:Subject|Picture|Video)\s+\d+>)/i.test(line);
   const values = audioOnly ? AUDIO_RETENTION : VISUAL_RETENTION;
-  const sourceToken = String(line || "").match(/(?:@Audio\d+\b|<Audio\s+\d+>)/i)?.[0] || "the source audio";
+  const sourceToken = String(line || "").match(/(?:@(?:VideoAudio|Audio)\d+\b|<Audio\s+\d+>)/i)?.[0] || "the source audio";
   return filterOptions(values.map(([value, detail, example, scaffold]) => {
     let insert = scaffold || `${value} - `;
     if (audioOnly && value === "fully_copy") insert = `fully_copy - reuse ${sourceToken} 1:1 as the complete final audio track`;
@@ -1357,18 +2086,27 @@ function filterOptions(options, query) {
   return options.filter((option) => `${option.label} ${option.detail || ""} ${option.example || ""} ${option.group || ""}`.toLowerCase().includes(q));
 }
 
-function customOptionsFirst(options) {
-  const custom = [];
-  const other = [];
-  for (const option of options || []) {
-    (option?.custom ? custom : other).push(option);
-  }
-  return [...custom, ...other];
+function optionChangeRank(option) {
+  if (option?.custom) return 0;
+  const label = String(option?.label || "").trim().toLowerCase();
+  const insert = String(option?.insertText ?? "");
+  // After Custom, keep the least-changing/opt-out choices at the top.
+  // The remaining contextual options stay in their authored order.
+  if (insert === "" || label === "none" || label === "n/a" || label === "done"
+      || label.startsWith("no ") || /^keep\s+.+\s+only$/.test(label)) return 1;
+  return 2;
 }
 
-function customPlaceholderOption(placeholder, label = "Custom…", detail = "Keep this field selected and type your own value.") {
+function leastChangeOptionsFirst(options) {
+  return (options || [])
+    .map((option, index) => ({ option, index, rank: optionChangeRank(option) }))
+    .sort((a, b) => a.rank - b.rank || a.index - b.index)
+    .map(({ option }) => option);
+}
+
+function customPlaceholderOption(placeholder, label = "Custom…", detail = "Remove this placeholder and type your own value.") {
   return {
-    ...insertOption(label, detail, placeholder.text, "Custom", placeholder.text),
+    ...insertOption(label, detail, "", "Custom"),
     custom: true,
   };
 }
@@ -1474,17 +2212,17 @@ function standaloneDefinitions(prompt) {
   const body = sectionBody(prompt, "subject_definitions", REF_SECTIONS);
   const definitions = [];
   const seen = new Set();
-  const re = /^\s*(?:@(Subject|Image|Video|Audio)(\d+)\b|<(Subject|Picture|Image|Video|Audio)\s+(\d+)>)/i;
+  const re = /^\s*(?:@(VideoAudio|Subject|Image|Video|Audio)(\d+)\b|<(Subject|Picture|Image|Video|Audio)\s+(\d+)>)/i;
   for (const line of body.split("\n")) {
     const match = line.match(re);
     if (!match) continue;
     const rawKind = String(match[1] || match[3]).toLowerCase();
-    const kind = rawKind === "picture" || rawKind === "image" ? "image" : rawKind;
+    const kind = rawKind === "picture" || rawKind === "image" ? "image" : rawKind === "videoaudio" ? "soundtrack" : rawKind;
     const ordinal = Number(match[2] || match[4]);
     const key = `${kind}:${ordinal}`;
     if (seen.has(key)) continue;
     seen.add(key);
-    const alias = kind === "image" ? `@Image${ordinal}` : `@${kind[0].toUpperCase()}${kind.slice(1)}${ordinal}`;
+    const alias = kind === "image" ? `@Image${ordinal}` : kind === "soundtrack" ? `@VideoAudio${ordinal}` : `@${kind[0].toUpperCase()}${kind.slice(1)}${ordinal}`;
     definitions.push({ kind, ordinal, token: alias, lineText: line.trim() });
   }
   return definitions;
@@ -1492,9 +2230,9 @@ function standaloneDefinitions(prompt) {
 
 function trackedReferenceDescriptors(state, prompt, kind = null) {
   return standaloneDefinitions(prompt)
-    .filter((definition) => !kind || definition.kind === kind)
+    .filter((definition) => !kind || (kind === "audio" ? isAudioReferenceKind(definition.kind) : definition.kind === kind))
     .map((definition) => {
-      const physical = state.refs.find((ref) => ref.kind === definition.kind && ref.ordinal === definition.ordinal);
+      const physical = physicalReferenceDescriptor(state, definition);
       return {
         ...definition,
         inputName: physical?.inputName || null,
@@ -1506,6 +2244,7 @@ function trackedReferenceDescriptors(state, prompt, kind = null) {
 }
 
 function referenceRegex(definition) {
+  if (definition.kind === "soundtrack") return new RegExp(`@VideoAudio${definition.ordinal}\\b`, "i");
   const alias = definition.kind === "image" ? "Image" : definition.kind[0].toUpperCase() + definition.kind.slice(1);
   const native = definition.kind === "image" ? "Picture" : alias;
   return new RegExp(`(?:@${alias}${definition.ordinal}\\b|<${native}\\s+${definition.ordinal}>)`, "i");
@@ -1533,18 +2272,19 @@ function missingRetentionOptions(state, prompt) {
   }
 
   return missing.map((definition) => {
-    const shots = definition.kind === "audio" || definition.kind === "video" ? [] : shotsContainingReference(prompt, definition);
+    const audioReference = isAudioReferenceKind(definition.kind);
+    const shots = audioReference || definition.kind === "video" ? [] : shotsContainingReference(prompt, definition);
     const shotList = shots.map((n) => `[Shot ${n}]`).join(", ");
     const occurrence = !shots.length ? "" : definition.kind === "subject" ? ` (appears in ${shotList})` : ` (${shotList})`;
-    const example = definition.kind === "audio"
+    const example = audioReference
       ? `${definition.token}: reference - match the defined timbre/rhythm/style property without copying the signal.`
       : `${definition.token}${occurrence || " (appears in [Shot 1])"}: fully_preserved - preserve the specific identity/content characteristics defined for this label.`;
     const keepNext = missing.length > 1 ? "\n{retention rows for tracked references}" : "";
-    const retentionField = definition.kind === "audio" ? "{audio retention}" : "{visual retention}";
+    const retentionField = audioReference ? "{audio retention}" : "{visual retention}";
     return {
       ...insertOption(`${definition.token} retention row`, `Missing row for this tracked label. Choose a marker, then state what changes.`, `${definition.token}${occurrence}: ${retentionField}${keepNext}`, "Current section · retention_analysis", retentionField, example),
-      previewType: definition.kind,
-      inputName: state.refs.find((ref) => ref.kind === definition.kind && ref.ordinal === definition.ordinal)?.inputName || null,
+      previewType: referencePreviewType(definition),
+      inputName: physicalReferenceDescriptor(state, definition)?.inputName || null,
     };
   });
 }
@@ -1630,14 +2370,14 @@ function nextShotScaffold(state, prompt) {
     return `${shot.text}The target video uses {visual style}. The shot uses {shot size / framing} framing from {viewpoint} and frames ${subject}. {action in playback order}. {camera movement if needed}. {synchronized sound / dialogue if present}.`;
   }
   if (isFirst && state.editorProfile === PROFILE.I2VA) {
-    return `${shot.text}The target video uses {visual style}. The shot uses {shot size / framing} framing from {viewpoint} and preserves @Image1 as the opening frame with {subject / scene / composition}. {action onset}. {continuous development}. {result / reaction}. {camera movement if needed}. {synchronized sound / dialogue if present}.`;
+    return `${shot.text}The shot begins from @Image1, preserving its visual style, subject identity, composition, and scene anchors: {subject / scene / composition}. {action onset}. {continuous development}. {result / reaction}. {camera movement if needed}. {synchronized sound / dialogue if present}.`;
   }
   if (isFirst && state.editorProfile === PROFILE.FL2VA) {
     const { opening, ending } = keyframeAliases(state);
-    return `${shot.text}The target video uses {visual style}. The shot uses {shot size / framing} framing from {viewpoint} and begins from ${opening}. {first-frame visible state}. {changes between first and last frame}. {approach to final frame}. {camera movement if needed}. {synchronized sound / dialogue if present}.`;
+    return `${shot.text}The shot begins from ${opening} and follows a continuous path toward ${ending}. {first-frame visible state}. {changes between first and last frame}. {approach to final frame}, reaching ${ending} as the final frame. {camera movement if needed}. {synchronized sound / dialogue if present}.`;
   }
   if (isFirst && state.editorProfile === PROFILE.L2VA) {
-    return `${shot.text}The target video uses {visual style}. The shot uses {shot size / framing} framing from {viewpoint} and starts before the supplied final frame. {state before the final frame}. {motion toward the final frame}. {final-frame convergence}. {camera movement if needed}. {synchronized sound / dialogue if present}.`;
+    return `${shot.text}The shot begins from a plausible earlier state compatible with @Image1. {state before the final frame}. {motion toward the final frame}. {final-frame convergence}, landing on @Image1 as the final frame. {camera movement if needed}. {synchronized sound / dialogue if present}.`;
   }
   if (isFirst && state.audioMode && state.editorProfile === PROFILE.REF2VA) {
     return `${shot.text}{audio events in playback order}. {synchronized sound / dialogue if present}.`;
@@ -1650,10 +2390,10 @@ function nextShotScaffold(state, prompt) {
   }
   if (!isFirst && state.editorProfile === PROFILE.FL2VA) {
     const ending = keyframeAliases(state).ending;
-    return `${shot.text}{cut / transition} a new shot using {shot size / framing} framing from {viewpoint}; the transition continues. {changes between first and last frame}. {approach to final frame}. {camera movement if needed}. {synchronized sound / dialogue if present}.`;
+    return `${shot.text}{cut / transition} a new shot using {shot size / framing} framing from {viewpoint}. {changes between first and last frame}. {approach to final frame}, with this final shot reaching ${ending} at the end of the video. {camera movement if needed}. {synchronized sound / dialogue if present}.`;
   }
   if (!isFirst && state.editorProfile === PROFILE.L2VA) {
-    return `${shot.text}{cut / transition} a new shot using {shot size / framing} framing from {viewpoint}; the transition continues. {motion toward the final frame}. {final-frame convergence}. {camera movement if needed}. {synchronized sound / dialogue if present}.`;
+    return `${shot.text}{cut / transition} a new shot using {shot size / framing} framing from {viewpoint}. {motion toward the final frame}. {final-frame convergence}, with this final shot landing on @Image1 at the end of the video. {camera movement if needed}. {synchronized sound / dialogue if present}.`;
   }
   if (state.audioMode) return `${shot.text}${isFirst ? "" : "{cut / transition} "}{audio events in playback order}. {synchronized sound / dialogue if present}.`;
   return `${shot.text}${isFirst ? "The shot uses " : "{cut / transition} a new shot using "}{shot size / framing} framing from {viewpoint} and frames ${subject}. The framed subject is {subject appearance / pose / frame position}. The scene shows {environment / lighting}. {action in playback order}. {secondary motion / physical response}. {camera movement if needed}. {synchronized sound / dialogue if present}.`;
@@ -1706,36 +2446,49 @@ function placeholderContext(placeholder, state, prompt) {
     return {
       label: "Cut / transition",
       options: [...cutTransitionOptions(), customPlaceholderOption(placeholder, "Custom transition…", "Type another transition only when you intentionally need it.")],
+      hint: "Use this only to begin a new shot. Prefer an ordinary cut unless a visible dissolve, fade, or wipe is intentional; use camera motion for changes inside one shot.",
     };
   }
   if (key === "dialogue language") {
     return { label: "Dialogue language", options: languagePlaceholderOptions(placeholder), hint: "All 11 stable H3 languages are listed; Custom keeps the field editable for another language." };
   }
   if (key === "define tracked reference content") {
+    const continueDefinition = (option) => ({
+      ...option,
+      insertText: `${option.insertText}\n{define tracked reference content}`,
+    });
     const options = [
-      ...subjectHelpers(state, prompt),
+      ...referenceRelationshipBundleOptions(state, prompt, placeholder),
+      ...subjectHelpers(state, prompt).map(continueDefinition),
       ...referenceOptions(state, prompt, "", "subject_definitions"),
-      customPlaceholderOption(placeholder, "Custom definition…", "Write the semantic Subject/Picture/Video/Audio definition yourself."),
+      insertOption("Done defining references", "Remove this optional next-definition field and continue to summary.", "", "Finish"),
+      customPlaceholderOption(placeholder, "Custom definition…", "Write the semantic Subject/Picture/Video/VideoAudio/Audio definition yourself."),
     ];
     return {
       label: "Define references",
       options,
-      hint: "Choose a semantic Subject/helper, a connected asset role, or Custom. Concrete @Image/@Video/@Audio role choices also appear when you type that exact @ label.",
+      hint: "Choose a semantic Subject/helper, a connected asset role, or Custom. Concrete @Image/@Video/@VideoAudio/@Audio role choices also appear when you type that exact @ label.",
     };
   }
   if (key === "retention rows for tracked references") {
     const options = missingRetentionOptions(state, prompt);
     return {
       label: "Missing retention rows",
-      options: options.length ? options : [customPlaceholderOption(placeholder, "Custom retention row…", "Write a retention row manually when you intentionally need one.")],
+      options: [
+        ...options,
+        insertOption("Done with retention", "Remove this optional next-retention field.", "", "Finish"),
+        customPlaceholderOption(placeholder, "Custom retention row…", "Write a retention row manually when you intentionally need one."),
+      ],
       hint: options.length ? "Choose a tracked label. If more tracked labels remain, the helper keeps this field available for the next row." : "No automatically detectable missing row remains.",
     };
   }
   if (key === "summary task type") {
+    const alreadyBracketed = prompt[placeholder.start - 1] === "[" && prompt[placeholder.end] === "]";
     return {
       label: "Task type",
       options: TASK_TYPES.map(([value, detail]) => {
-        const insert = `[${value}{additional task type if needed}]`;
+        const taskTypes = `${value}{additional task type if needed}`;
+        const insert = alreadyBracketed ? taskTypes : `[${taskTypes}]`;
         return insertOption(value, detail, insert, "MiniMax task types", "{additional task type if needed}");
       }),
     };
@@ -1807,7 +2560,7 @@ function placeholderContext(placeholder, state, prompt) {
     if (state.editorProfile === PROFILE.REF2VA) options.push(...styleSubjectOptions(prompt));
     options.push(...presetPlaceholderOptions(placeholder));
     options.push(customPlaceholderOption(placeholder, "Custom visual style…", "Type any visual style. The presets are examples, not a closed H3 enum."));
-    return { label: "Visual style", options, hint: "MiniMax documents several common style examples; the field itself remains free-form." };
+    return { label: "Visual style", options, hint: state.editorProfile === PROFILE.REF2VA ? "Keep the Reference style opening to one or two sentences before [Shot 1]. The style field itself remains free-form." : "MiniMax documents several common style examples; the field itself remains free-form." };
   }
   if (["target subject", "subject", "subject / scene", "subject / scene / composition"].includes(key)) {
     return { label: "Subject / scene", options: openPlaceholderOptions(placeholder, state, prompt, { includeSubjects: true }), hint: "Tracked Subjects appear first in Reference mode; common generic starters follow; Custom stays editable." };
@@ -1826,7 +2579,7 @@ function placeholderContext(placeholder, state, prompt) {
   }
   if (key === "spoken words") {
     const options = [];
-    if (state.editorProfile === PROFILE.REF2VA && state.audioCount > 0) options.push(insertOption("[unclear]", "Use only for unintelligible words in referenced source audio.", "[unclear]", "Reference-audio control"));
+    if (state.editorProfile === PROFILE.REF2VA && (state.audioReferenceCount ?? state.audioCount) > 0) options.push(insertOption("[unclear]", "Use only for unintelligible words in referenced source audio.", "[unclear]", "Reference-audio control"));
     options.push(customPlaceholderOption(placeholder, "Type exact dialogue / lyrics…", "Keep the intended words in their original language; do not let the helper invent them."));
     return { label: "Spoken words", options, hint: "Exact-content field: the helper intentionally does not fabricate dialogue or lyrics." };
   }
@@ -1839,6 +2592,43 @@ function placeholderContext(placeholder, state, prompt) {
     label: key.replace(/^./, (letter) => letter.toUpperCase()),
     options,
     hint: options.length > 1 ? "Choose a common editable preset or Custom." : "Choose Custom to type the exact value.",
+  };
+}
+
+function filledPresetTrigger(textarea, state, prompt, section) {
+  const filled = filledPresetAtCaret(textarea);
+  if (!filled) return null;
+  const placeholder = {
+    text: filled.text,
+    key: filled.key,
+    start: filled.start,
+    end: filled.end,
+    help: EDITOR_PLACEHOLDER_HELP[filled.key],
+    highlighted: false,
+  };
+  const context = placeholderContext(placeholder, state, prompt);
+  const options = (context.options || []).map((option) => {
+    if (option.custom) {
+      return {
+        ...option,
+        label: "Edit current text…",
+        detail: `Select “${filled.text}” so you can type a custom replacement without changing anything first.`,
+        editExisting: true,
+      };
+    }
+    const insert = String(option.insertText ?? option.label ?? "").trim();
+    if (insert === filled.text) return { ...option, group: "Current choice", detail: `Current value. ${option.detail || "Choose another row to replace it."}` };
+    return option;
+  });
+  if (!options.some((option) => !option.info)) return null;
+  return {
+    kind: "filled-choice",
+    start: filled.start,
+    end: filled.end,
+    query: "",
+    options,
+    section,
+    hint: `${context.label} · choose another value or edit the current text`,
   };
 }
 
@@ -1914,42 +2704,129 @@ function contextualOptions(section, state, prompt) {
   return [];
 }
 
-function baseStarterProfile(state) {
-  if ((state?.keyframeCount || 0) <= 0) return PROFILE.T2VA;
-  if (state.keyframeCount === 1) return state.keyframeRole === KEYFRAME_LAST ? PROFILE.L2VA : PROFILE.I2VA;
-  return PROFILE.FL2VA;
-}
-
-function starterTemplateState(state, { audio = false, reference = false } = {}) {
-  const editorProfile = reference ? PROFILE.REF2VA : (audio ? PROFILE.T2VA : baseStarterProfile(state));
+function starterTemplateState(state, editorProfile, audioMode = false, keyframeCount = 0, keyframeRole = KEYFRAME_FIRST, audioStarterTask = null) {
   return {
-    ...state,
-    mode: audio ? MODE_AUDIO : MODE_VIDEO,
-    audioMode: audio,
     editorProfile,
-    mixedConditioningFamilies: false,
+    audioMode,
+    audioStarterTask,
+    keyframeCount,
+    keyframeRole,
+    effectiveSeconds: state.effectiveSeconds,
   };
 }
 
-function starterTemplateOptions(state) {
-  const baseVideo = starterTemplateState(state, { audio: false, reference: false });
-  const refVideo = starterTemplateState(state, { audio: false, reference: true });
-  const baseAudio = starterTemplateState(state, { audio: true, reference: false });
-  const refAudio = starterTemplateState(state, { audio: true, reference: true });
-  const baseLabel = baseVideo.editorProfile === PROFILE.T2VA
-    ? "T2V / T2VA · base video"
-    : `${baseVideo.editorProfile} · endpoint video`;
+function replaceTemplateSectionBody(template, section, nextSection, body) {
+  const source = String(template || "");
+  const header = `${section}:\n`;
+  const start = source.indexOf(header);
+  if (start < 0) return source;
+  const bodyStart = start + header.length;
+  const end = source.indexOf(`\n\n${nextSection}:`, bodyStart);
+  if (end < 0) return source;
+  return source.slice(0, bodyStart) + body + source.slice(end);
+}
+
+function draftTimelineParts(draft) {
+  const source = String(draft || "").trim();
+  const first = /^\[Shot\s+1\]\s*/i.exec(source);
+  if (!first) return { firstShot: source, laterShots: "" };
+  const body = source.slice(first[0].length);
+  const later = /\n[ \t]*\[Shot\s+(?:[2-9]\d*|1\d+)\]/i.exec(body);
+  if (!later) return { firstShot: body.trim(), laterShots: "" };
+  return {
+    firstShot: body.slice(0, later.index).trim(),
+    laterShots: body.slice(later.index).trim(),
+  };
+}
+
+function wrappedStarterTemplate(template, profile, audioMode, draft, placement) {
+  const source = String(draft || "").trim();
+  if (profile === PROFILE.REF2VA && placement === "summary") {
+    return replaceTemplateSectionBody(template, "summary", "retention_analysis", `[{summary task type}] ${source}`);
+  }
+  const { firstShot, laterShots } = draftTimelineParts(source);
+  if (!firstShot) return template;
+  const targetField = audioMode
+    ? "{audio events in playback order}"
+    : profile === PROFILE.I2VA
+      ? "{action onset}"
+      : profile === PROFILE.L2VA
+        ? "{motion toward the final frame}"
+        : profile === PROFILE.FL2VA
+          ? "{changes between first and last frame}"
+          : "{action in playback order}";
+  if (!template.includes(targetField)) return template;
+  const fieldWithPeriod = `${targetField}.`;
+  let result = /[.!?]$/.test(firstShot) && template.includes(fieldWithPeriod)
+    ? template.replace(fieldWithPeriod, firstShot)
+    : template.replace(targetField, firstShot);
+  if (laterShots) {
+    const section = profile === PROFILE.REF2VA ? "detailed_description" : "integrated_multimodal_description";
+    result = appendSectionText(result, section, "overall_soundscape", laterShots);
+  }
+  return result;
+}
+
+function starterTemplateOptions(state, currentPrompt = "") {
+  const starters = [
+    ["T2V / T2VA · base video", "Base text-to-audio-video prompt structure. Sets Mode to Video.", PROFILE.T2VA, false, 0, KEYFRAME_FIRST, "Video templates", null],
+    ["I2V / I2VA · first frame", "First-frame prompt structure. Sets Mode to Video and Image 1 to First frame; connect an opening frame before execution.", PROFILE.I2VA, false, 1, KEYFRAME_FIRST, "Video templates", null],
+    ["L2V / L2VA · last frame", "Last-frame convergence prompt structure. Sets Mode to Video and Image 1 to Last frame; connect an ending frame before execution.", PROFILE.L2VA, false, 1, KEYFRAME_LAST, "Video templates", null],
+    ["FL2V / FL2VA · first + last frames", "First-and-last-frame prompt structure. Sets Mode to Video and Image 1 to First frame; connect both endpoint frames before execution.", PROFILE.FL2VA, false, 2, KEYFRAME_FIRST, "Video templates", null],
+    ["R2V / REF2VA · full reference", "Full-reference six-section structure. Sets Mode to Video; connected Reference media still choose conditioning.", PROFILE.REF2VA, false, 0, KEYFRAME_FIRST, "Reference templates", null],
+    ["T2A · base audio proxy", "Base audio-proxy prompt structure. Sets Mode to Audio.", PROFILE.T2VA, true, 0, KEYFRAME_FIRST, "Audio templates", "T2A"],
+    ["R2A · general reference audio proxy", "General reference audio-proxy structure. Sets Mode to Audio; connect the intended Reference media.", PROFILE.REF2VA, true, 0, KEYFRAME_FIRST, "Audio templates", "R2A"],
+    ["I2A · image-guided audio proxy", "Image-guided audio-proxy structure. Sets Mode to Audio; connect Reference image 1.", PROFILE.REF2VA, true, 0, KEYFRAME_FIRST, "Audio templates", "I2A"],
+    ["V2A · video-guided audio proxy", "Video-guided audio-proxy structure. Sets Mode to Audio; connect Reference video 1 for timing/whole-video structure. Mute it for visual-only guidance; define @VideoAudio1 separately when its soundtrack is reused or referenced.", PROFILE.REF2VA, true, 0, KEYFRAME_FIRST, "Audio templates", "V2A"],
+    ["A2A · audio-guided audio proxy", "Audio-guided audio-proxy structure. Sets Mode to Audio; connect standalone Reference audio 1.", PROFILE.REF2VA, true, 0, KEYFRAME_FIRST, "Audio templates", "A2A"],
+  ];
+  const draft = String(currentPrompt || "").trim();
+  const draftStartsWithShot = /^\[Shot\s+1\]/i.test(draft);
+  const templateOptions = starters.flatMap(([label, detail, profile, audioMode, keyframeCount, keyframeRole, group, audioStarterTask]) => {
+    const templateState = starterTemplateState(state, profile, audioMode, keyframeCount, keyframeRole, audioStarterTask);
+    const starterControls = {
+      modeValue: audioMode ? MODE_AUDIO : MODE_VIDEO,
+      ...(keyframeCount > 0 ? { keyframeRoleValue: keyframeRole } : {}),
+    };
+    const starterOption = (...args) => ({ ...insertOption(...args), ...starterControls });
+    const blank = templateForState(templateState, "");
+    const wrapperTemplate = templateForState(templateState, draft);
+    if (!draft) return [starterOption(label, detail, blank, group)];
+    const options = [];
+    if (profile === PROFILE.REF2VA) {
+      if (!draftStartsWithShot) {
+        options.push(starterOption(
+          `Wrap draft as summary / ${label}`,
+          "Keep the current prose as the high-level premise and add the official Reference sections around it.",
+          wrappedStarterTemplate(wrapperTemplate, profile, audioMode, draft, "summary"),
+          "Use current draft",
+        ));
+      }
+      options.push(starterOption(
+        `Wrap draft as shots / ${label}`,
+        "Place the current prose in the target timeline and retain editable Reference definitions, task, retention, shot-detail, and audio fields.",
+        wrappedStarterTemplate(wrapperTemplate, profile, audioMode, draft, "detailed"),
+        "Use current draft",
+      ));
+    } else {
+      options.push(starterOption(
+        `Wrap draft / ${label}`,
+        "Place the current prose in the target timeline and retain the editable Base shot-detail and audio fields around it.",
+        wrappedStarterTemplate(wrapperTemplate, profile, audioMode, draft, "detailed"),
+        "Use current draft",
+      ));
+    }
+    options.push(starterOption(`${label} / blank template`, `${detail} This replaces the current draft.`, blank, group));
+    return options;
+  });
   return [
     { ...insertOption("Custom…", "Keep the current text and write the prompt manually.", "", "Custom"), custom: true, noop: true },
-    { ...insertOption(baseLabel, "Base H3 video+audio structure. Connected endpoint frames are reflected when present.", templateForState(baseVideo, ""), "Video templates"), modeValue: MODE_VIDEO },
-    { ...insertOption("R2V / REF2VA · full reference", "Full-reference six-section structure for connected image/video/audio references.", templateForState(refVideo, ""), "Video templates"), modeValue: MODE_VIDEO },
-    { ...insertOption("T2A · audio-focused proxy", "Easy audio-focused structure with a disposable 32x32 visual stream. H3 still generates joint audio+video latents.", templateForState(baseAudio, ""), "Audio templates"), modeValue: MODE_AUDIO },
-    { ...insertOption("R2A / REF2A · reference-audio proxy", "Full-reference structure focused on generated audio and voice/music/SFX references, with a disposable 32x32 visual stream.", templateForState(refAudio, ""), "Audio templates"), modeValue: MODE_AUDIO },
+    ...templateOptions,
   ];
 }
 
 function hasStructuredPromptStart(text) {
-  return /^\s*(?:How the reference pictures align with the target video|For the target video, at 0\.00 seconds|subject_definitions\s*:|integrated_multimodal_description\s*:|\[Shot\s+1\])/i.test(String(text || ""));
+  return /^\s*(?:How the reference pictures align with the target video|For the target video, at 0\.00 seconds|subject_definitions\s*:|integrated_multimodal_description\s*:)/i.test(String(text || ""));
 }
 
 function starterTemplateAvailable(textarea) {
@@ -1971,7 +2848,7 @@ function starterTemplateAvailable(textarea) {
 function contextHint(state, before) {
   const sections = state.editorProfile === PROFILE.REF2VA ? REF_SECTIONS : BASE_SECTIONS;
   const section = currentSectionBeforeCaret(before, sections);
-  if (!String(before || "").trim()) return "Tab = choose Custom / T2V / R2V / T2A / R2A starter · @ = connected references";
+  if (!String(before || "").trim()) return "Tab = choose any H3 starter · @ = connected references";
   if (insideDialogue(before) && section === timelineSection(state)) return "Dialogue · # = controls · [ = language tag · Tab = next field";
   if (section === "subject_definitions") return "Subjects · @ = connected references · Tab = next field";
   if (section === "summary") return "Summary · [ = task type · @ = tracked references · Tab = next field";
@@ -1989,7 +2866,7 @@ function tokenEnd(text, caret, pattern) {
   return end;
 }
 
-function detectTrigger(textarea, state, prompt) {
+function detectTrigger(textarea, state, prompt, allowFilledPreset = true) {
   const caret = textarea.selectionStart ?? 0;
   const before = textarea.value.slice(0, caret);
   const line = before.slice(before.lastIndexOf("\n") + 1);
@@ -2014,7 +2891,7 @@ function detectTrigger(textarea, state, prompt) {
       if (state.editorProfile === PROFILE.REF2VA && section && section !== "subject_definitions") {
         options = [infoOption(
           "No defined reference labels here",
-          "Define the tracked @Subject/@Image/@Video/@Audio relationship in subject_definitions: first, then reference that label here.",
+          "Define the tracked @Subject/@Image/@Video/@VideoAudio/@Audio relationship in subject_definitions: first, then reference that label here.",
           "References",
         )];
       } else if (!(state.refs || []).length) {
@@ -2037,29 +2914,69 @@ function detectTrigger(textarea, state, prompt) {
   match = line.match(/#([A-Za-z-]*)$/);
   if (match && section === timeline) {
     const start = caret - match[0].length;
+    const end = tokenEnd(textarea.value, caret, /[A-Za-z-]/);
     const controls = dialogueOptions(state, prompt);
-    const options = insideDialogue(before) ? controls.filter((option) => option.group === "Dialogue controls") : controls;
-    return { kind: "dialogue", start, end: caret, query: match[1] || "", options: filterOptions(options, match[1] || ""), section };
+    const options = insideDialogue(before) ? controls.filter((option) => ["Dialogue controls", "Dialogue continuity"].includes(option.group)) : controls;
+    return { kind: "dialogue", start, end, query: match[1] || "", options: filterOptions(options, match[1] || ""), section };
   }
 
-  match = line.match(/\[([^\]\n]*)$/);
+  match = line.match(/\[([^\[\]\n]*)$/);
   if (match) {
     const start = caret - match[0].length;
     const closing = textarea.value.indexOf("]", caret);
-    const end = closing >= caret && !textarea.value.slice(caret, closing).includes("\n") ? closing + 1 : caret;
-    return { kind: "bracket", start, end, query: match[1] || "", options: bracketOptions(state, prompt, match[1] || "", before, section), section };
+    const suffix = closing >= caret ? textarea.value.slice(caret, closing) : "";
+    const end = closing >= caret && !suffix.includes("\n") && !suffix.includes("[") ? closing + 1 : caret;
+    const bracketValue = end > caret ? textarea.value.slice(start + 1, end - 1).trim() : "";
+    const dialogueStart = before.toLowerCase().lastIndexOf("<d>");
+    const atDialogueLanguagePosition = section === timeline
+      && insideDialogue(before)
+      && dialogueStart >= 0
+      && /^\s*$/.test(textarea.value.slice(dialogueStart + 3, start));
+    const exactUnclear = end > caret && bracketValue.toLowerCase() === "unclear";
+    if (exactUnclear && atDialogueLanguagePosition) {
+      return {
+        kind: "dialogue-language",
+        start,
+        end,
+        query: "",
+        options: [
+          infoOption("[unclear] is not a language", "Choose the dialogue language here. Put [unclear] only among the spoken words copied from referenced source audio.", "Dialogue language"),
+          ...languageOptions(),
+        ],
+        section,
+      };
+    }
+    if (exactUnclear && section === timeline && insideDialogue(before)) {
+      const referenceAudioAvailable = state.editorProfile === PROFILE.REF2VA && (state.audioReferenceCount ?? state.audioCount) > 0;
+      const options = referenceAudioAvailable
+        ? [
+            insertOption("[unclear] · current", "Keep this unintelligible span from referenced source audio.", "[unclear]", "Reference-audio controls"),
+            insertOption("Remove [unclear]", "Delete this transcription marker.", "", "Reference-audio controls"),
+          ]
+        : [
+            infoOption("[unclear] needs referenced source audio", "This marker is only for unintelligible words copied from a Reference audio source.", "Dialogue controls"),
+            insertOption("Remove [unclear]", "Delete this unavailable transcription marker.", "", "Dialogue controls"),
+          ];
+      return { kind: "bracket", start, end, query: "", options, section };
+    }
+    if (atDialogueLanguagePosition && end > caret) {
+      return { kind: "dialogue-language", start, end, query: "", options: languageOptions("", bracketValue), section };
+    }
+    const optionPrompt = end > caret ? `${textarea.value.slice(0, start)}${textarea.value.slice(end)}` : prompt;
+    return { kind: "bracket", start, end, query: match[1] || "", options: bracketOptions(state, optionPrompt, match[1] || "", before, section), section };
   }
 
-  match = line.match(/\(([^)\n]*)$/);
+  match = line.match(/\(([^()\n]*)$/);
   if (match && (section === timeline || (state.editorProfile === PROFILE.REF2VA && section === "subject_definitions"))) {
     const start = caret - match[0].length;
     const closing = textarea.value.indexOf(")", caret);
-    const end = closing >= caret && !textarea.value.slice(caret, closing).includes("\n") ? closing + 1 : caret;
+    const suffix = closing >= caret ? textarea.value.slice(caret, closing) : "";
+    const end = closing >= caret && !suffix.includes("\n") && !suffix.includes("(") ? closing + 1 : caret;
     return { kind: "speaker", start, end, query: match[1] || "", options: speakerOptions(prompt, match[1] || "", section === timeline), section };
   }
 
   if (state.editorProfile === PROFILE.REF2VA) {
-    match = line.match(/((?:@(Subject|Image|Video|Audio)\d+\b|<(?:Subject|Picture|Image|Video|Audio)\s+\d+>)[^\n]*):\s*([A-Za-z_]*)$/i);
+    match = line.match(/((?:@(VideoAudio|Subject|Image|Video|Audio)\d+\b|<(?:Subject|Picture|Image|Video|Audio)\s+\d+>)[^\n]*):\s*([A-Za-z_]*)$/i);
     if (match && section === "retention_analysis") {
       const query = match[3] || "";
       let start = caret - query.length;
@@ -2072,10 +2989,13 @@ function detectTrigger(textarea, state, prompt) {
       return { kind: "retention", start, end, query, options: retentionTriggerOptions(match[1], query), section };
     }
   }
+  if (!allowFilledPreset) return null;
+  const filled = filledPresetTrigger(textarea, state, prompt, section);
+  if (filled) return filled;
   return null;
 }
 
-function normalizedReplacementEnd(source, start, end, insertText) {
+function normalizedReplacementEnd(source, start, end, insertText, preserveBoundaryPunctuation = false) {
   const safeStart = Math.max(0, Math.min(Number(start) || 0, source.length));
   let safeEnd = Math.max(safeStart, Math.min(Number(end) || safeStart, source.length));
   const inserted = String(insertText ?? "");
@@ -2086,7 +3006,13 @@ function normalizedReplacementEnd(source, start, end, insertText) {
   // presets already include their own terminator. Consume only punctuation that
   // begins exactly at the replacement boundary so choosing a preset cannot make
   // `..`, `?.`, `!.`, etc. Do not rewrite punctuation elsewhere in user prose.
-  if (/[.!?]/.test(last) && /[.!?]/.test(source[safeEnd] || "")) {
+  if (!trimmed && !preserveBoundaryPunctuation && /[.!?]/.test(source[safeEnd] || "")) {
+    while (/[.!?]/.test(source[safeEnd] || "")) safeEnd += 1;
+    // Optional scaffold fields are commonly written as `{field}. `; when the
+    // field is removed, consume that separator space too so an explicit opt-out
+    // does not leave a visible double-space before the next sentence/field.
+    if (source[safeEnd] === " ") safeEnd += 1;
+  } else if (/[.!?]/.test(last) && /[.!?]/.test(source[safeEnd] || "")) {
     while (/[.!?]/.test(source[safeEnd] || "")) safeEnd += 1;
   } else if (/[,;:]/.test(last) && source[safeEnd] === last) {
     while (source[safeEnd] === last) safeEnd += 1;
@@ -2094,10 +3020,10 @@ function normalizedReplacementEnd(source, start, end, insertText) {
   return safeEnd;
 }
 
-function replaceRange(textarea, start, end, insertText, selectText = null, selectPlaceholder = false) {
+function replaceRange(textarea, start, end, insertText, selectText = null, selectPlaceholder = false, preserveBoundaryPunctuation = false) {
   const source = String(textarea.value || "");
   const safeStart = Math.max(0, Math.min(Number(start) || 0, source.length));
-  const safeEnd = normalizedReplacementEnd(source, safeStart, end, insertText);
+  const safeEnd = normalizedReplacementEnd(source, safeStart, end, insertText, preserveBoundaryPunctuation);
   textarea.focus({ preventScroll: true });
   textarea.setSelectionRange(safeStart, safeEnd);
 
@@ -2132,6 +3058,32 @@ function replaceRange(textarea, start, end, insertText, selectText = null, selec
     }
   }
   textarea.setSelectionRange(caret, caret);
+}
+
+function deterministicDiagnosticRepair(prompt, diagnostic) {
+  const source = String(prompt || "");
+  const code = String(diagnostic?.code || "");
+  if (code === "keyframe-first-line") {
+    const expected = String(diagnostic?.example || "").trim();
+    if (!expected) return null;
+    const content = source.trimStart();
+    if (!content) return expected;
+    const lineEnd = content.indexOf("\n");
+    const firstLine = (lineEnd < 0 ? content : content.slice(0, lineEnd)).trim();
+    const rest = lineEnd < 0 ? "" : content.slice(lineEnd + 1).replace(/^(?:\r?\n)+/, "");
+    const hasAlignmentLine = /^(?:For the target video, at 0\.00 seconds into the target video,|How the reference pictures align with the target video)/i.test(firstLine);
+    if (hasAlignmentLine) return rest ? `${expected}\n\n${rest}` : expected;
+    return `${expected}\n\n${content}`;
+  }
+  if (code === "keyframe-blank-line") {
+    const content = source.trimStart();
+    const lineEnd = content.indexOf("\n");
+    if (lineEnd < 0) return null;
+    const firstLine = content.slice(0, lineEnd).trimEnd();
+    const rest = content.slice(lineEnd + 1).replace(/^(?:\r?\n)+/, "");
+    return rest ? `${firstLine}\n\n${rest}` : firstLine;
+  }
+  return null;
 }
 
 function sourceNodeForInput(node, inputName) {
@@ -2272,6 +3224,37 @@ function firstSelectableMenuIndex(trigger) {
   return selectableMenuIndices(trigger)[0] ?? -1;
 }
 
+function updateMenuInspector(controller) {
+  const options = controller?.trigger?.options || [];
+  const option = options[controller?.menuIndex] || (selectableMenuIndices(controller?.trigger).length ? null : options.find((item) => item.info));
+  const inspector = controller?.menuInspector;
+  if (!inspector) return;
+  const detail = inspector.querySelector(".h3e-menu-inspector-detail");
+  const insert = inspector.querySelector(".h3e-menu-inspector-insert");
+  const detailText = String(option?.detail || option?.label || "");
+  const insertText = String(option?.insertText || "");
+  const showInsert = !["context", "placeholder", "starter", "guide-target", "filled-choice"].includes(controller?.trigger?.kind)
+    && Boolean(insertText && insertText !== String(option?.label || "") && (insertText.includes("{") || insertText.includes(" - ")));
+  if (detail) { detail.textContent = detailText; detail.title = detailText; }
+  if (insert) {
+    insert.textContent = showInsert ? insertText : "";
+    insert.title = showInsert ? insertText : "";
+    insert.hidden = !showInsert;
+  }
+}
+
+function scrollMenuRowIntoView(controller, row) {
+  const scroll = controller?.menuScroll;
+  if (!scroll || !row) return;
+  const top = row.offsetTop;
+  const bottom = top + row.offsetHeight;
+  const viewTop = scroll.scrollTop;
+  const viewBottom = viewTop + scroll.clientHeight;
+  const edgePad = 6;
+  if (top < viewTop + edgePad) scroll.scrollTop = Math.max(0, top - edgePad);
+  else if (bottom > viewBottom - edgePad) scroll.scrollTop += bottom - (viewBottom - edgePad);
+}
+
 function updateMenuSelection(controller, nextIndex, scroll = true, explicit = false) {
   const previous = controller.menuRows?.get(controller.menuIndex);
   if (previous) previous.classList.remove("selected");
@@ -2280,8 +3263,9 @@ function updateMenuSelection(controller, nextIndex, scroll = true, explicit = fa
   const current = controller.menuRows?.get(nextIndex);
   if (current) {
     current.classList.add("selected");
-    if (scroll) current.scrollIntoView?.({ block: "nearest" });
+    if (scroll) scrollMenuRowIntoView(controller, current);
   }
+  updateMenuInspector(controller);
 }
 
 function moveMenuSelection(controller, delta) {
@@ -2308,27 +3292,36 @@ function renderMenu(controller) {
   if (!trigger || !trigger.options?.length) {
     menu.classList.remove("open");
     controller.menuIndex = -1;
+    controller.setMenuOpen(false);
     return;
   }
   if (!controller.selectableIndices.includes(controller.menuIndex)) controller.menuIndex = controller.selectableIndices[0] ?? -1;
-  const keyHint = document.createElement("div");
-  keyHint.className = "h3e-menu-keyhint";
-  keyHint.textContent = "Highlighted text = replacement target · Hover or ↑/↓ to choose · Tab / Enter / click to insert · untouched Custom + Tab = next field · Esc close";
-  menu.appendChild(keyHint);
+  const scroll = document.createElement("div");
+  scroll.className = "h3e-menu-scroll";
+  controller.menuScroll = scroll;
+  const inspector = document.createElement("div");
+  inspector.className = "h3e-menu-inspector";
+  const inspectorDetail = document.createElement("div");
+  inspectorDetail.className = "h3e-menu-inspector-detail";
+  const inspectorInsert = document.createElement("div");
+  inspectorInsert.className = "h3e-menu-inspector-insert";
+  inspector.append(inspectorDetail, inspectorInsert);
+  controller.menuInspector = inspector;
+  menu.append(scroll, inspector);
   let lastGroup = null;
   trigger.options.forEach((option, index) => {
     if (option.group && option.group !== lastGroup) {
       const group = document.createElement("div");
       group.className = "h3e-menu-group";
       group.textContent = option.group;
-      menu.appendChild(group);
+      scroll.appendChild(group);
       lastGroup = option.group;
     }
     const row = document.createElement("div");
     row.className = `h3e-menu-row${option.info ? " is-info" : ""}${index === controller.menuIndex ? " selected" : ""}`;
     row.dataset.optionIndex = String(index);
     const showInsert = !["context", "placeholder", "starter"].includes(trigger.kind) && Boolean(option.insertText && (String(option.insertText).includes("{") || String(option.insertText).includes(" - ")));
-    const tooltip = [option.detail, option.insertText && option.insertText !== option.label ? `Insert: ${option.insertText}` : ""].filter(Boolean).join("\n");
+    const tooltip = [option.detail, showInsert ? `Insert: ${option.insertText}` : ""].filter(Boolean).join("\n");
     if (tooltip) row.title = tooltip;
     const preview = makeReferencePreview(controller, option);
     if (preview) row.appendChild(preview);
@@ -2358,9 +3351,11 @@ function renderMenu(controller) {
       });
     }
     controller.menuRows.set(index, row);
-    menu.appendChild(row);
+    scroll.appendChild(row);
   });
   menu.classList.add("open");
+  controller.setMenuOpen(true);
+  updateMenuInspector(controller);
 }
 
 const OUTPUT_ASPECT_RATIOS = Object.freeze({
@@ -2382,14 +3377,25 @@ const OUTPUT_SHORT_EDGE = Object.freeze({
   "512P (draft)": 512,
 });
 
+function roundHalfEven(value) {
+  const lower = Math.floor(value);
+  return value - lower === 0.5 ? lower + lower % 2 : Math.round(value);
+}
+
+function alignedPreviewDimension(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return null;
+  return Math.max(32, roundHalfEven(numeric / 32) * 32);
+}
+
 function outputResolutionGeometry(node, state) {
-  const selected = String(directWidgetValue(node, "canvas", H3E_DEFAULTS.canvas));
+  const selected = String(widgetValue(node, "canvas", H3E_DEFAULTS.canvas));
   if (selected === H3E_VALUES.audioProxyCanvas) {
     return { width: 32, height: 32, value: (32 * 32) / 1_000_000, approximate: false, adaptive: false };
   }
   if (selected === "Custom exact") {
-    const width = Math.max(32, Math.round(Number(directWidgetValue(node, "width", H3E_DEFAULTS.customWidth)) / 32) * 32);
-    const height = Math.max(32, Math.round(Number(directWidgetValue(node, "height", H3E_DEFAULTS.customHeight)) / 32) * 32);
+    const width = alignedPreviewDimension(widgetValue(node, "width", H3E_DEFAULTS.customWidth));
+    const height = alignedPreviewDimension(widgetValue(node, "height", H3E_DEFAULTS.customHeight));
     if (Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0) {
       return { width, height, value: (width * height) / 1_000_000, approximate: false, adaptive: false };
     }
@@ -2402,19 +3408,20 @@ function outputResolutionGeometry(node, state) {
   if (layoutState.frameDrivesAspect) {
     // The frontend knows the selected resolution class but not the tensor shape
     // produced by an arbitrary upstream IMAGE node. Do not fabricate dimensions.
-    // Give the class-area estimate and state explicitly that geometry resolves
-    // from the connected endpoint at execution.
+    // Give the theoretical class-area range before per-axis 32px alignment and
+    // state explicitly that final geometry resolves from the endpoint at execution.
     const nativeMaxPixels = 768 * 1344;
     return {
       width: null,
       height: null,
+      minimumValue: shortEdge ** 2 / 1_000_000,
       value: nativeMaxPixels * (shortEdge / 768) ** 2 / 1_000_000,
       approximate: true,
       adaptive: true,
     };
   }
 
-  const aspect = String(directWidgetValue(node, "aspect_ratio", H3E_DEFAULTS.aspectRatio));
+  const aspect = String(widgetValue(node, "aspect_ratio", H3E_DEFAULTS.aspectRatio));
   const ratio = OUTPUT_ASPECT_RATIOS[aspect];
   if (!ratio) return null;
   const [ratioW, ratioH] = ratio;
@@ -2428,8 +3435,8 @@ function outputResolutionGeometry(node, state) {
     nominalW *= scale;
     nominalH *= scale;
   }
-  const width = Math.max(32, Math.round(nominalW / 32) * 32);
-  const height = Math.max(32, Math.round(nominalH / 32) * 32);
+  const width = alignedPreviewDimension(nominalW);
+  const height = alignedPreviewDimension(nominalH);
   return { width, height, value: (width * height) / 1_000_000, approximate: false, adaptive: false };
 }
 
@@ -2437,6 +3444,93 @@ function formatMegapixels(value) {
   if (!Number.isFinite(value)) return null;
   if (value < 0.01) return value.toFixed(3);
   return value.toFixed(2);
+}
+
+function conditioningBuilderSummary(state) {
+  return {
+    [PROFILE.T2VA]: "Text",
+    [PROFILE.I2VA]: "First frame",
+    [PROFILE.L2VA]: "Last frame",
+    [PROFILE.FL2VA]: "First + last frames",
+    [PROFILE.REF2VA]: "Reference",
+  }[state?.conditioningProfile] || "Unknown";
+}
+
+function renderPromptSummary(controller, state, validation) {
+  const provision = state?.modelSelection || CONDITIONING_MODEL_FL2VA;
+  const builder = conditioningBuilderSummary(state);
+  const grammarLabel = state?.editorProfileSource === "mixed"
+    ? "Grammar mixed"
+    : state?.editorProfileSource === "prompt"
+      ? `Grammar ${state.editorProfile}`
+      : `Helper ${state?.editorProfile || PROFILE.T2VA}`;
+  const muted = state?.mutedVideoAudioOrdinals?.length
+    ? `${state.mutedVideoAudioOrdinals.map((ordinal) => `V${ordinal}`).join("/")} audio muted`
+    : "";
+  const summaryText = [`Provision ${provision}`, `Builder ${builder}`, grammarLabel, muted].filter(Boolean).join(" · ");
+  controller.summaryState.textContent = summaryText;
+  controller.summaryState.title = [
+    `Provision: ${provision} from Easy Loader.`,
+    `Conditioning builder: ${builder}, selected by connected physical inputs.`,
+    state?.editorProfileSource === "mixed"
+      ? "Prompt grammar: mixed Base and Reference markers; resolve the structure diagnostic before using guide navigation."
+      : state?.editorProfileSource === "prompt"
+        ? `Prompt grammar: ${state.editorProfile}, recognized from the prompt structure.`
+        : `Writing helper: ${state?.editorProfile || PROFILE.T2VA}, inferred from connections until the prompt establishes a recognizable grammar.`,
+    "Provision, builder, and prompt grammar are independent and do not select one another.",
+    "Downstream LoRAs and model patches are outside this node and are not inspected.",
+    muted ? `Embedded soundtrack conditioning is disabled for ${state.mutedVideoAudioOrdinals.map((ordinal) => `Video ${ordinal}`).join(", ")}; video frames and timing remain active.` : "",
+  ].filter(Boolean).join("\n");
+
+  const progress = validation?.guideProgress || null;
+  controller.guideProgress = progress;
+  const mixed = state?.editorProfileSource === "mixed";
+  const targets = Array.isArray(progress?.targets) ? progress.targets : [];
+  const remaining = Number(progress?.remaining ?? targets.length) || 0;
+  const actionable = !mixed && remaining > 0 && Boolean(progress?.nextSection && progress?.nextRange);
+  if (mixed) {
+    controller.guideButton.textContent = "Guide paused · mixed grammar";
+    controller.guideButton.title = "Resolve the mixed Base/Reference prompt structure first. This does not change Easy Loader provision or physical conditioning.";
+  } else if (remaining > 0 && progress?.nextSection) {
+    const nextLabel = progress.nextLabel || `Fill ${progress.nextSection}`;
+    const hasStructuralFix = targets.some((target) => ["duplicate", "out of order"].includes(target.reason));
+    const countLabel = hasStructuralFix ? `${remaining} target${remaining === 1 ? "" : "s"}` : `${remaining} to fill`;
+    const targetList = targets.map((target, index) => `${index + 1}. ${target.label}`).join("\n");
+    controller.guideButton.textContent = `Guide · ${countLabel} · ${nextLabel} ›`;
+    controller.guideButton.title = `${remaining} current Guide target${remaining === 1 ? "" : "s"}. Click to work on ${nextLabel}. Missing or empty structure opens an explicit choice; existing prompt text is not changed until you choose an action.${targetList ? `\n\n${targetList}` : ""}`;
+  } else {
+    controller.guideButton.textContent = "Guide · no prompt targets";
+    controller.guideButton.title = "No current navigable prompt-writing targets. Connection and setting errors remain in the separate validation diagnostic.";
+  }
+  controller.guideButton.disabled = !actionable;
+  controller.guideButton.setAttribute("aria-label", controller.guideButton.title);
+}
+
+function guideTargetInsertion(state, prompt, progress) {
+  if (!progress?.nextSection || !["missing", "empty"].includes(progress.nextReason)) return null;
+  const sections = state.editorProfile === PROFILE.REF2VA ? REF_SECTIONS : BASE_SECTIONS;
+  if (!sections.includes(progress.nextSection)) return null;
+  const body = sectionBody(templateForState(state, ""), progress.nextSection, sections);
+  if (!body) return null;
+  if (progress.nextReason === "empty") {
+    return {
+      label: `Insert editable ${progress.nextSection} scaffold`,
+      detail: `Fill the empty ${progress.nextSection}: body with the current writing-helper scaffold. Nothing changes until you choose this action.`,
+      insertText: `\n${body}`,
+    };
+  }
+
+  const source = String(prompt || "");
+  const insertion = Math.max(0, Math.min(Number(progress.nextRange?.start) || 0, source.length));
+  const before = source.slice(0, insertion);
+  const after = source.slice(insertion);
+  const leading = before && !before.endsWith("\n\n") ? (before.endsWith("\n") ? "\n" : "\n\n") : "";
+  const trailing = after && !after.startsWith("\n\n") ? (after.startsWith("\n") ? "\n" : "\n\n") : "";
+  return {
+    label: `Insert missing ${progress.nextSection}: section`,
+    detail: `Insert the missing ${progress.nextSection}: section in canonical order with editable fields. Nothing changes until you choose this action.`,
+    insertText: `${leading}${progress.nextSection}:\n${body}${trailing}`,
+  };
 }
 
 function updateDerivedWidgetLabels(node, state) {
@@ -2455,98 +3549,27 @@ function updateDerivedWidgetLabels(node, state) {
   const canvasWidget = (node?.widgets || []).find((widget) => widgetNameMatches(widget?.name, "canvas"));
   if (canvasWidget) {
     const geometry = outputResolutionGeometry(node, state);
+    const minimumFormatted = geometry ? formatMegapixels(geometry.minimumValue) : null;
     const formatted = geometry ? formatMegapixels(geometry.value) : null;
     if (geometry && formatted && Number.isFinite(geometry.width) && Number.isFinite(geometry.height)) {
       canvasWidget.label = `Output resolution · ${geometry.width}×${geometry.height} · ${formatted} MP`;
-    } else if (geometry?.adaptive && formatted) {
-      canvasWidget.label = `Output resolution · endpoint-adaptive · ~${formatted} MP class`;
+    } else if (geometry?.adaptive && minimumFormatted && formatted) {
+      canvasWidget.label = `Output resolution · frame-adaptive · ~${minimumFormatted}-${formatted} MP pre-align`;
     } else {
       canvasWidget.label = FRIENDLY_WIDGET_LABELS.get("canvas") || "Output resolution";
     }
   }
-}
 
-function directWidgetValue(node, suffix, fallback = "") {
-  const widget = (node?.widgets || []).find((item) => widgetNameMatches(item?.name, suffix));
-  return widget?.value ?? fallback;
-}
-
-function selectedModelInfo(node, state) {
-  const source = sourceNodeForInput(node, "h3_bundle");
-  if (!source) {
-    return { text: "Selected model: connect H3 Bundle", title: "Connect MiniMax H3 Easy Loader (or another H3 Bundle source) to resolve the selected diffusion model." };
+  for (let slot = 0; slot < 3; slot += 1) {
+    const widget = (node?.widgets || []).find((item) => widgetNameMatches(item?.name, `ref_video_use_audio_${slot}`));
+    if (widget) widget.label = FRIENDLY_WIDGET_LABELS.get(`ref_video_use_audio_${slot}`) || `Use Video ${slot + 1} soundtrack`;
   }
-
-  const frameModel = String(directWidgetValue(source, "fl2va_model", "") || "");
-  const referenceModel = String(directWidgetValue(source, "ref2va_model", "") || "");
-  const audioOverride = String(directWidgetValue(source, "audio_model", AUTO_AUDIO_MODEL_LABEL) || AUTO_AUDIO_MODEL_LABEL);
-  if (!frameModel && !referenceModel) {
-    return { text: "Selected model: unavailable from H3 Bundle source", title: "The connected H3 Bundle source does not expose Easy Loader model selectors in the frontend, so the exact model filename cannot be resolved here." };
-  }
-  const referenceRoute = state?.conditioningProfile === PROFILE.REF2VA;
-  const usesAudioOverride = Boolean(state?.audioMode && audioOverride && audioOverride !== AUTO_AUDIO_MODEL_LABEL);
-  const selected = usesAudioOverride ? audioOverride : (referenceRoute ? referenceModel : frameModel);
-  const route = usesAudioOverride ? "audio-only override" : (referenceRoute ? "Reference conditioning" : "text / frame conditioning");
-  if (!selected) {
-    return { text: "Selected model: unresolved", title: `The ${route} selector on the connected H3 Easy Loader has no resolved filename.` };
-  }
-  return {
-    text: `Selected model: ${selected}`,
-    title: `${route} selected from the connected conditioning inputs. Prompt templates only control editor assistance/validation and never enable, disable, or reroute connected media.`,
-  };
-}
-
-function subscribeModelSource(sourceNode, listener) {
-  if (!sourceNode || typeof listener !== "function") return () => {};
-  let record = modelSourceObservers.get(sourceNode);
-  if (!record) {
-    const original = sourceNode.onWidgetChanged;
-    const listeners = new Set();
-    const wrapped = function (...args) {
-      const result = original?.apply(this, args);
-      for (const callback of [...listeners]) {
-        try { callback(...args); } catch (error) { console.warn("MiniMax H3 Easy model status listener failed", error); }
-      }
-      return result;
-    };
-    record = { original, wrapped, listeners };
-    modelSourceObservers.set(sourceNode, record);
-    sourceNode.onWidgetChanged = wrapped;
-  }
-  record.listeners.add(listener);
-  return () => {
-    const current = modelSourceObservers.get(sourceNode);
-    if (!current) return;
-    current.listeners.delete(listener);
-    if (current.listeners.size) return;
-    if (sourceNode.onWidgetChanged === current.wrapped) sourceNode.onWidgetChanged = current.original;
-    modelSourceObservers.delete(sourceNode);
-  };
-}
-
-async function copyTextToClipboard(text) {
-  const value = String(text ?? "");
-  if (!value) return false;
-  if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
-    try {
-      await navigator.clipboard.writeText(value);
-      return true;
-    } catch (_error) {
-      // Fall through to the DOM copy path when clipboard permission is denied.
-    }
-  }
-  if (typeof document === "undefined" || !document.body) return false;
-  const scratch = document.createElement("textarea");
-  scratch.value = value;
-  scratch.setAttribute("readonly", "");
-  scratch.style.position = "fixed";
-  scratch.style.opacity = "0";
-  document.body.appendChild(scratch);
-  scratch.select();
-  let copied = false;
-  try { copied = Boolean(document.execCommand?.("copy")); } catch (_error) { copied = false; }
-  scratch.remove();
-  return copied;
+  connectedInputs(node, "ref_video_").forEach((input, index) => {
+    const slot = autogrowInputSlot(input?.name, "ref_video_");
+    if (!Number.isFinite(slot)) return;
+    const widget = (node?.widgets || []).find((item) => widgetNameMatches(item?.name, `ref_video_use_audio_${slot}`));
+    if (widget) widget.label = `Use Reference Video ${index + 1} soundtrack · @VideoAudio${index + 1}`;
+  });
 }
 
 function makeController(node, nativePromptWidget) {
@@ -2555,36 +3578,11 @@ function makeController(node, nativePromptWidget) {
   injectStyles();
   const wrapper = document.createElement("div");
   wrapper.className = "h3e-editor";
-  const modelLine = document.createElement("div");
-  modelLine.className = "h3e-model-line";
-  modelLine.textContent = "Selected model: resolving…";
-  const compiledLine = document.createElement("div");
-  compiledLine.className = "h3e-compiled-line";
-  compiledLine.textContent = "▸ Compiled Prompt: (empty)";
-  compiledLine.title = "Click to expand the live compiled prompt. The node's Compiled Prompt output is the exact backend result after execution.";
-  compiledLine.tabIndex = 0;
-  compiledLine.setAttribute("role", "button");
-  compiledLine.setAttribute("aria-expanded", "false");
-  const compiledPanel = document.createElement("div");
-  compiledPanel.className = "h3e-compiled-panel";
-  compiledPanel.hidden = true;
-  const compiledPre = document.createElement("pre");
-  compiledPre.className = "h3e-compiled-pre";
-  compiledPre.textContent = "(empty)";
-  const compiledActions = document.createElement("div");
-  compiledActions.className = "h3e-compiled-actions";
-  const compiledCopy = document.createElement("button");
-  compiledCopy.type = "button";
-  compiledCopy.className = "h3e-compiled-copy";
-  compiledCopy.textContent = "Copy";
-  compiledCopy.disabled = true;
-  compiledActions.append(compiledCopy);
-  compiledPanel.append(compiledPre, compiledActions);
   const routeNotice = document.createElement("div");
   routeNotice.className = "h3e-route-notice";
   routeNotice.hidden = true;
-  routeNotice.textContent = "Reference route · endpoint frames connected but not forwarded";
-  routeNotice.title = "Reference media select ComfyUI's Reference conditioning builder. Current native Reference conditioning has no first/last-frame sockets, so connected endpoint frames stay wired but are not forwarded for this execution.";
+  routeNotice.textContent = "";
+  routeNotice.title = "";
   const head = document.createElement("div");
   head.className = "h3e-head";
   const profile = document.createElement("div");
@@ -2595,10 +3593,25 @@ function makeController(node, nativePromptWidget) {
   status.tabIndex = -1;
   status.setAttribute("role", "button");
   status.setAttribute("aria-label", "Prompt validation status");
+  const statusToggle = document.createElement("span");
+  statusToggle.className = "h3e-status-toggle";
+  statusToggle.textContent = "▸";
+  statusToggle.setAttribute("aria-hidden", "true");
   const statusMain = document.createElement("span");
   statusMain.className = "h3e-status-main";
-  status.append(statusMain);
+  status.append(statusToggle, statusMain);
   head.append(profile, status);
+  const summary = document.createElement("div");
+  summary.className = "h3e-summary";
+  const summaryState = document.createElement("span");
+  summaryState.className = "h3e-summary-state";
+  summaryState.textContent = "Provision · Builder · Grammar";
+  const guideButton = document.createElement("button");
+  guideButton.type = "button";
+  guideButton.className = "h3e-guide-progress";
+  guideButton.textContent = "Guide · waiting";
+  guideButton.disabled = true;
+  summary.append(summaryState, guideButton);
   const diagnostic = document.createElement("div");
   diagnostic.className = "h3e-diagnostic";
   const diagnosticMain = document.createElement("div");
@@ -2625,14 +3638,20 @@ function makeController(node, nativePromptWidget) {
   diagnosticNext.textContent = "›";
   diagnosticNext.setAttribute("aria-label", "Next prompt diagnostic");
   diagnosticNav.append(diagnosticPrev, diagnosticCount, diagnosticNext);
-  diagnosticMain.append(diagnosticCopy, diagnosticNav);
+  diagnosticMain.append(diagnosticCopy);
+  head.append(diagnosticNav);
   const diagnosticExample = document.createElement("span");
   diagnosticExample.className = "h3e-diagnostic-example";
-  diagnostic.append(diagnosticMain, diagnosticExample);
+  const diagnosticApply = document.createElement("button");
+  diagnosticApply.type = "button";
+  diagnosticApply.className = "h3e-diagnostic-apply";
+  diagnosticApply.textContent = "Apply structural fix";
+  diagnosticApply.hidden = true;
+  diagnostic.append(diagnosticMain, diagnosticExample, diagnosticApply);
   const textarea = document.createElement("textarea");
   textarea.className = "h3e-textarea";
   textarea.spellcheck = false;
-  textarea.placeholder = inputData?.[1]?.placeholder || inputData?.placeholder || "Tab opens Custom / T2V / R2V / T2A / R2A starters · @ references · [ shots/tasks · # dialogue";
+  textarea.placeholder = inputData?.[1]?.placeholder || inputData?.placeholder || "Tab opens all H3 starters · @ references · [ shots/tasks · # dialogue";
   const contextbar = document.createElement("div");
   contextbar.className = "h3e-contextbar";
   const hint = document.createElement("div");
@@ -2641,14 +3660,14 @@ function makeController(node, nativePromptWidget) {
   contextbar.append(hint);
   const menu = document.createElement("div");
   menu.className = "h3e-menu";
-  wrapper.append(modelLine, compiledLine, compiledPanel, routeNotice, head, diagnostic, textarea, menu, contextbar);
+  wrapper.append(head, summary, diagnostic, routeNotice, textarea, menu, contextbar);
 
   const defaultValue = String(nativePromptWidget?.value ?? inputData?.[1]?.default ?? inputData?.default ?? "");
   textarea.value = defaultValue;
   const controller = {
-    node, inputName, nativePromptWidget, wrapper, modelLine, compiledLine, compiledPanel, compiledPre, compiledCopy, routeNotice, textarea, menu, profile, status, statusMain, diagnostic, diagnosticTitle, diagnosticMessage, diagnosticExample, diagnosticNav, diagnosticPrev, diagnosticNext, diagnosticCount, hint,
-    widget: null, trigger: null, menuIndex: -1, menuSelectionExplicit: false, refreshTimer: null, diagnosticIndex: 0, notesExpanded: false, compiledExpanded: false,
-    modelSourceNode: null, disposeModelSourceObserver: null, layoutRouteSignature: null,
+    node, inputName, nativePromptWidget, wrapper, routeNotice, textarea, menu, profile, status, statusToggle, statusMain, summaryState, guideButton, diagnostic, diagnosticTitle, diagnosticMessage, diagnosticExample, diagnosticApply, diagnosticNav, diagnosticPrev, diagnosticNext, diagnosticCount, hint,
+    widget: null, trigger: null, menuIndex: -1, menuSelectionExplicit: false, menuNavigationActive: false, menuOpen: false, menuAutoBaseHeight: null, menuAutoTargetHeight: null, refreshTimer: null, widgetRefreshTimer: null, connectionRefreshTimer: null, diagnosticIndex: 0, diagnosticExpanded: false, guideProgress: null,
+    layoutVisibilitySignature: null,
     suppressAutocomplete: false, applyingCompletion: false,
     selectableIndices: [], menuRows: new Map(), previewCache: new Map(),
     externalRevision: 0, stateCache: null, validation: null,
@@ -2665,39 +3684,43 @@ function makeController(node, nativePromptWidget) {
       this.stateCache = null;
       this.previewCache.clear();
     },
-    setCompiledExpanded(expanded) {
-      this.compiledExpanded = Boolean(expanded);
-      compiledPanel.hidden = !this.compiledExpanded;
-      compiledLine.setAttribute("aria-expanded", this.compiledExpanded ? "true" : "false");
-      this.scheduleRefresh(0);
-    },
-    updateSelectedModelLine(state = this.getState()) {
-      const info = selectedModelInfo(node, state);
-      if (modelLine.textContent !== info.text) modelLine.textContent = info.text;
-      modelLine.title = info.title || info.text;
-    },
-    syncModelSourceObserver() {
-      const source = sourceNodeForInput(node, "h3_bundle");
-      if (source === this.modelSourceNode) return;
-      this.disposeModelSourceObserver?.();
-      this.disposeModelSourceObserver = null;
-      this.modelSourceNode = source;
-      if (source) {
-        this.disposeModelSourceObserver = subscribeModelSource(source, () => {
-          this.updateSelectedModelLine();
-        });
+    setMenuOpen(open) {
+      const next = Boolean(open);
+      if (next === this.menuOpen) return;
+      this.menuOpen = next;
+
+      const width = Number(node?.size?.[0]);
+      const height = Number(node?.size?.[1]);
+      if (this.widget && Number.isFinite(width) && Number.isFinite(height) && typeof node?.setSize === "function") {
+        if (next) {
+          this.menuAutoBaseHeight = height;
+          this.menuAutoTargetHeight = height + MENU_LAYOUT_HEIGHT;
+          node.setSize([width, this.menuAutoTargetHeight]);
+        } else {
+          const base = this.menuAutoBaseHeight;
+          const target = this.menuAutoTargetHeight;
+          // Only undo our own automatic growth. If the user resized while the
+          // menu was open, keep their new node size instead of fighting it.
+          if (Number.isFinite(base) && Number.isFinite(target) && Math.abs(height - target) <= 4) {
+            node.setSize([width, base]);
+          }
+          this.menuAutoBaseHeight = null;
+          this.menuAutoTargetHeight = null;
+        }
       }
-      this.updateSelectedModelLine();
+      node.graph?.setDirtyCanvas?.(true, false);
     },
     closeMenu() {
-      if (!this.trigger && !menu.classList.contains("open") && !menu.childNodes.length) return;
+      if (!this.trigger && !menu.classList.contains("open") && !menu.childNodes.length && !this.menuOpen) return;
       this.trigger = null;
       this.menuIndex = -1;
       this.menuSelectionExplicit = false;
+      this.menuNavigationActive = false;
       this.selectableIndices = [];
       this.menuRows.clear();
       menu.replaceChildren();
       menu.classList.remove("open");
+      this.setMenuOpen(false);
     },
     commit() {
       // Keep ComfyUI's native STRING widget as the only serialized prompt value.
@@ -2710,7 +3733,7 @@ function makeController(node, nativePromptWidget) {
       // item and collapse advisory notes on the next validation pass.
       this.diagnosticIndex = 0;
       this.notesExpanded = false;
-      this.scheduleRefresh(120);
+      this.scheduleRefresh(160);
     },
     syncFromNative(force = false) {
       if (!this.nativePromptWidget) return false;
@@ -2723,15 +3746,29 @@ function makeController(node, nativePromptWidget) {
       this.stateCache = null;
       return true;
     },
-    scheduleRefresh(delay = 120) {
+    scheduleRefresh(delay = 160) {
       clearTimeout(this.refreshTimer);
-      this.refreshTimer = setTimeout(() => this.refresh(), delay);
+      this.refreshTimer = setTimeout(() => {
+        this.refreshTimer = null;
+        try {
+          this.refresh();
+        } catch (error) {
+          console.error("[MiniMax H3 Easy] Prompt editor refresh failed.", error);
+          statusMain.className = "h3e-status-main is-error";
+          statusMain.textContent = "Editor refresh failed";
+          status.title = "Prompt editor refresh failed. Open the browser developer console for the underlying error.";
+          status.classList.remove("is-actionable");
+          status.tabIndex = -1;
+          statusToggle.textContent = "";
+        }
+      }, delay);
     },
     updateHint(state = this.getState(), placeholder = editorPlaceholderAtSelection(textarea)) {
       const before = textarea.value.slice(0, textarea.selectionStart ?? textarea.value.length);
       const placeholderUi = placeholder ? placeholderContext(placeholder, state, textarea.value) : null;
+      const customHint = placeholderUi?.options?.some((option) => option.custom) ? " · untouched Custom + Tab next" : "";
       const text = placeholder
-        ? (placeholderUi?.options?.length ? `${placeholderUi.label} · ↑/↓ choose · Tab/Enter insert · untouched Custom + Tab next · Shift+Tab previous` : (placeholderUi?.hint || placeholder.help))
+        ? (placeholderUi?.options?.length ? `${placeholderUi.label} · ↑/↓ choose · Tab/Enter insert${customHint} · Shift+Tab previous` : (placeholderUi?.hint || placeholder.help))
         : contextHint(state, before);
       if (hint.textContent !== text) hint.textContent = text;
       hint.title = text;
@@ -2750,29 +3787,42 @@ function makeController(node, nativePromptWidget) {
     },
     renderDiagnostic() {
       const { kind, items } = this.diagnosticItems();
-      if (!items.length || (kind === "note" && !this.notesExpanded)) return false;
+      if (!items.length) return false;
       this.diagnosticIndex = Math.max(0, Math.min(this.diagnosticIndex, items.length - 1));
       const current = items[this.diagnosticIndex];
       const ordinal = this.diagnosticIndex + 1;
       const isIssue = kind === "issue";
       diagnostic.classList.toggle("is-note", !isIssue);
-      if (isIssue) {
-        statusMain.className = "h3e-status-main is-error";
-        const label = items.length > 1 ? `${ordinal}/${items.length} · ${current.title}` : current.title;
-        if (statusMain.textContent !== label) statusMain.textContent = label;
-        status.title = [current.message, current.example ? `Example: ${current.example.replace(/\s+/g, " ")}` : ""].filter(Boolean).join("\n");
-        const actionable = Boolean(current?.range);
-        status.classList.toggle("is-actionable", actionable);
-        status.tabIndex = actionable ? 0 : -1;
-      }
-      diagnostic.classList.add("open");
+      statusMain.className = isIssue ? "h3e-status-main is-error" : "h3e-status-main is-ok";
+      const label = current.title;
+      if (statusMain.textContent !== label) statusMain.textContent = label;
+      statusToggle.textContent = this.diagnosticExpanded ? "▾" : "▸";
+      status.title = [current.message, current.example ? `Try: ${current.example.replace(/\s+/g, " ")}` : ""].filter(Boolean).join("\n");
+      status.classList.add("is-actionable");
+      status.tabIndex = 0;
       diagnosticTitle.textContent = `${current.title}: `;
       diagnosticMessage.textContent = current.message;
-      diagnosticExample.textContent = current.example ? `Example: ${current.example.replace(/\s+/g, " ")}` : "";
+      diagnosticExample.textContent = current.example ? `Try:\n${current.example}` : "";
+      diagnosticApply.hidden = !isIssue || deterministicDiagnosticRepair(textarea.value, current) == null;
+      diagnostic.title = [current.title, current.message, current.example ? `Try: ${current.example.replace(/\s+/g, " ")}` : ""].filter(Boolean).join("\n");
+      diagnostic.classList.toggle("open", this.diagnosticExpanded);
       diagnosticNav.classList.toggle("open", items.length > 1);
       diagnosticCount.textContent = `${ordinal}/${items.length}`;
       diagnosticPrev.disabled = this.diagnosticIndex <= 0;
       diagnosticNext.disabled = this.diagnosticIndex >= items.length - 1;
+      return true;
+    },
+    applyDiagnosticRepair(item = this.currentDiagnostic()) {
+      const repaired = deterministicDiagnosticRepair(textarea.value, item);
+      if (repaired == null || repaired === textarea.value) return false;
+      this.applyingCompletion = true;
+      try {
+        replaceRange(textarea, 0, textarea.value.length, repaired);
+      } finally {
+        this.applyingCompletion = false;
+      }
+      this.commit();
+      textarea.focus({ preventScroll: true });
       return true;
     },
     navigateDiagnostic(delta) {
@@ -2782,7 +3832,6 @@ function makeController(node, nativePromptWidget) {
       if (next === this.diagnosticIndex) return false;
       this.diagnosticIndex = next;
       this.renderDiagnostic();
-      this.focusDiagnostic(items[next]);
       return true;
     },
     focusDiagnostic(issue = this.currentDiagnostic()) {
@@ -2801,39 +3850,52 @@ function makeController(node, nativePromptWidget) {
       this.updateHint();
       return true;
     },
+    focusGuideTarget() {
+      const state = this.getState();
+      const validation = validatePrompt(textarea.value, state);
+      this.validation = validation;
+      const progress = validation.guideProgress;
+      this.guideProgress = progress;
+      const range = progress?.nextRange;
+      if (!progress?.nextSection || !range || state.editorProfileSource === "mixed") return false;
+      const sourceLength = textarea.value.length;
+      const start = Math.max(0, Math.min(Number(range.start) || 0, sourceLength));
+      const end = Math.max(start, Math.min(Number(range.end) || start, sourceLength));
+      this.suppressAutocomplete = true;
+      this.closeMenu();
+      textarea.focus({ preventScroll: true });
+      textarea.setSelectionRange(start, end);
+      const lineHeight = Number.parseFloat(getComputedStyle(textarea).lineHeight) || 18;
+      const precedingLines = textarea.value.slice(0, start).split("\n").length - 1;
+      textarea.scrollTop = Math.max(0, precedingLines * lineHeight - textarea.clientHeight * 0.35);
+      const placeholder = editorPlaceholderAtSelection(textarea);
+      this.updateHint(state, placeholder);
+      if (placeholder) return this.openSelectedPlaceholderChoices(state, placeholder);
+      if (progress.nextReason === "missing" && state.editorProfileSource !== "prompt") return this.openStarterTemplates(state);
+      if (start === end && ["missing", "empty"].includes(progress.nextReason)) return this.openGuideTargetChoices(state, progress);
+      return true;
+    },
     refresh() {
       const state = this.getState();
-      const layoutRouteSignature = state.conditioningProfile;
-      if (layoutRouteSignature !== this.layoutRouteSignature) {
-        this.layoutRouteSignature = layoutRouteSignature;
+      const editorActive = document.activeElement === textarea;
+      const layoutVisibilitySignature = `${state.mode}|${state.canvasMode}|${state.keyframeRole}|${state.keyframeCanvas}|${state.conditioningProfile}|${state.keyframeCount}|${state.imageCount}|${state.videoCount}`;
+      if (layoutVisibilitySignature !== this.layoutVisibilitySignature) {
+        this.layoutVisibilitySignature = layoutVisibilitySignature;
         syncLayoutWidgetVisibility(node, this, state);
-        node.graph?.setDirtyCanvas?.(true, true);
+        node.graph?.setDirtyCanvas?.(true, false);
       }
       updateDerivedWidgetLabels(node, state);
-      this.syncModelSourceObserver();
-      this.updateSelectedModelLine(state);
-      this.updateHint(state);
+      if (!editorActive) this.updateHint(state);
       const result = validatePrompt(textarea.value, state);
       this.validation = result;
-      const compiled = String(result.compiledPreview || "");
-      const compactCompiled = compiled.replace(/\s+/g, " ").trim();
-      const compiledArrow = this.compiledExpanded ? "▾" : "▸";
-      compiledLine.textContent = `${compiledArrow} Compiled Prompt: ${compactCompiled || "(empty)"}`;
-      compiledLine.title = compiled
-        ? "Click to expand/collapse the live compiled prompt. The node's Compiled Prompt output is the exact backend result after execution."
-        : "Compiled prompt is empty. The node's Compiled Prompt output is the exact backend result after execution.";
-      compiledPre.textContent = compiled || "(empty)";
-      compiledCopy.disabled = !compiled;
-      compiledLine.classList.toggle("is-unresolved", result.issues.some((item) => ["base-reference-type", "unresolved-reference", "invalid-reference-ordinal"].includes(item.code)));
-      routeNotice.hidden = !state.ignoredKeyframeInputs;
+      renderPromptSummary(this, state, result);
+      routeNotice.hidden = !state.hasMixedInputFamilies;
+      if (state.hasMixedInputFamilies) {
+        routeNotice.textContent = "Disconnect Reference media or first/last frames";
+        routeNotice.title = "The two physical input families require different native H3 builders. Easy blocks this ambiguous workflow instead of silently ignoring endpoint frames.";
+      }
       const description = profileDescription(state);
-      const profileLabel = state.mixedConditioningFamilies
-        ? "Mixed"
-        : (state.displayAudioMode
-          ? (state.promptAudioIntent
-            ? (state.editorProfile === PROFILE.REF2VA ? "R2A / REF2A" : "T2A")
-            : (state.audioTask || "Audio-first"))
-          : state.editorProfile);
+      const profileLabel = state.editorProfile;
       if (profile.textContent !== profileLabel) profile.textContent = profileLabel;
       profile.title = description;
       if (result.issues.length) {
@@ -2848,23 +3910,28 @@ function makeController(node, nativePromptWidget) {
         const inspectable = result.notes.length > 0;
         status.classList.toggle("is-actionable", inspectable);
         status.tabIndex = inspectable ? 0 : -1;
-        if (inspectable && this.notesExpanded) {
+        statusToggle.textContent = inspectable ? (this.diagnosticExpanded ? "▾" : "▸") : "";
+        if (inspectable) {
           this.renderDiagnostic();
         } else {
+          this.diagnosticExpanded = false;
           diagnostic.classList.remove("open", "is-note");
           diagnosticNav.classList.remove("open");
           diagnosticCount.textContent = "";
           diagnosticTitle.textContent = "";
           diagnosticMessage.textContent = "";
           diagnosticExample.textContent = "";
+          diagnosticApply.hidden = true;
+          statusToggle.textContent = "";
         }
       }
-      if (document.activeElement === textarea) this.syncMenu();
+      if (editorActive) this.syncMenu(false);
     },
-    syncMenu() {
+    syncMenu(allowFilledPreset = true) {
       const state = this.getState();
       const placeholder = editorPlaceholderAtSelection(textarea);
-      if (this.trigger?.kind === "reference-followup"
+      if (this.trigger?.kind === "starter" && textarea.value === this.trigger.sourceText) return;
+      if (["reference-followup", "guide-target"].includes(this.trigger?.kind)
         && textarea.selectionStart === this.trigger.start
         && textarea.selectionEnd === this.trigger.end) {
         return;
@@ -2872,17 +3939,21 @@ function makeController(node, nativePromptWidget) {
       this.updateHint(state, placeholder);
       if (this.suppressAutocomplete) { this.closeMenu(); return; }
       if (placeholder && this.openSelectedPlaceholderChoices(state, placeholder)) return;
-      const trigger = detectTrigger(textarea, state, textarea.value);
+      const trigger = detectTrigger(textarea, state, textarea.value, allowFilledPreset);
       if (!trigger) { this.closeMenu(); return; }
-      const options = customOptionsFirst(trigger.options);
+      const options = leastChangeOptionsFirst(trigger.options);
       const signature = `${trigger.kind}|${trigger.start}|${trigger.end}|${trigger.query}|${options.map((o) => o.label).join("\u001f")}`;
       if (signature === this.trigger?.signature) return;
       this.trigger = { ...trigger, options, signature };
       this.menuIndex = firstSelectableMenuIndex(this.trigger);
       renderMenu(this);
+      if (trigger.hint) {
+        hint.textContent = trigger.hint;
+        hint.title = trigger.hint;
+      }
     },
     openStarterTemplates(state = this.getState()) {
-      const options = customOptionsFirst(starterTemplateOptions(state));
+      const options = leastChangeOptionsFirst(starterTemplateOptions(state, textarea.value));
       const signature = `starter|${textarea.value.length}|${options.map((o) => o.label).join("\u001f")}`;
       if (signature === this.trigger?.signature) return true;
       this.suppressAutocomplete = false;
@@ -2893,6 +3964,7 @@ function makeController(node, nativePromptWidget) {
         query: "",
         options,
         section: null,
+        sourceText: textarea.value,
         signature,
       };
       this.menuIndex = firstSelectableMenuIndex(this.trigger);
@@ -2900,8 +3972,35 @@ function makeController(node, nativePromptWidget) {
       this.updateHint(state, null);
       return true;
     },
+    openGuideTargetChoices(state, progress) {
+      const insertion = guideTargetInsertion(state, textarea.value, progress);
+      if (!insertion) return false;
+      const insert = {
+        ...insertOption(insertion.label, insertion.detail, insertion.insertText, "Guide"),
+        selectText: firstEditorPlaceholder(insertion.insertText),
+      };
+      const manual = { ...insertOption("Write here manually…", `Keep the ${progress.nextSection}: target unchanged and type your own content.`, "", "Guide"), noop: true };
+      const options = [insert, manual];
+      const signature = `guide-target|${progress.nextSection}|${progress.nextReason}|${progress.nextRange.start}|${options.map((option) => option.label).join("\u001f")}`;
+      this.suppressAutocomplete = false;
+      this.trigger = {
+        kind: "guide-target",
+        start: progress.nextRange.start,
+        end: progress.nextRange.end,
+        query: "",
+        options,
+        section: progress.nextSection,
+        signature,
+      };
+      this.menuIndex = firstSelectableMenuIndex(this.trigger);
+      renderMenu(this);
+      const text = `${progress.nextLabel || progress.nextSection} · choose scaffold or write manually`;
+      hint.textContent = text;
+      hint.title = text;
+      return true;
+    },
     openReferenceFollowup(ref, start, end, section, state = this.getState()) {
-      const options = referenceFollowupOptions(ref, state, textarea.value, section);
+      const options = referenceFollowupOptions(ref, state, textarea.value, section, { start, end });
       if (options.length <= 1) return false;
       this.suppressAutocomplete = false;
       this.trigger = {
@@ -2925,7 +4024,7 @@ function makeController(node, nativePromptWidget) {
     openSelectedPlaceholderChoices(state = this.getState(), placeholder = editorPlaceholderAtSelection(textarea)) {
       if (!placeholder) { this.closeMenu(); return false; }
       const context = placeholderContext(placeholder, state, textarea.value);
-      const options = customOptionsFirst(context.options);
+      const options = leastChangeOptionsFirst(context.options);
       if (!options.length) { this.closeMenu(); return false; }
       this.suppressAutocomplete = false;
       const before = textarea.value.slice(0, textarea.selectionStart ?? textarea.value.length);
@@ -2954,27 +4053,48 @@ function makeController(node, nativePromptWidget) {
       const customEditing = Boolean(option.custom);
       this.suppressAutocomplete = true;
       this.closeMenu();
+      if (option.editExisting) {
+        textarea.focus({ preventScroll: true });
+        textarea.setSelectionRange(trigger.start, trigger.end);
+        this.updateHint(this.getState(), null);
+        return;
+      }
       if (option.noop) {
         textarea.focus({ preventScroll: true });
         this.updateHint(this.getState(), editorPlaceholderAtSelection(textarea));
         return;
       }
+      let controlsChanged = false;
       if (option.modeValue) {
         const modeWidget = (node?.widgets || []).find((widget) => widgetNameMatches(widget?.name, "mode"));
-        if (modeWidget) modeWidget.value = option.modeValue;
-        syncLayoutWidgetVisibility(node, this);
+        if (modeWidget && modeWidget.value !== option.modeValue) {
+          modeWidget.value = option.modeValue;
+          controlsChanged = true;
+        }
+      }
+      if (option.keyframeRoleValue) {
+        const roleWidget = (node?.widgets || []).find((widget) => widgetNameMatches(widget?.name, "keyframe_role"));
+        if (roleWidget && roleWidget.value !== option.keyframeRoleValue) {
+          roleWidget.value = option.keyframeRoleValue;
+          controlsChanged = true;
+        }
+      }
+      if (controlsChanged) {
         this.invalidateExternalState();
-        node.graph?.setDirtyCanvas?.(true, true);
+        syncLayoutWidgetVisibility(node, this, this.getState());
+        node.graph?.setDirtyCanvas?.(true, false);
       }
       this.applyingCompletion = true;
       try {
-        const insert = option.insertText ?? option.label;
+        const replaceWholePrompt = typeof option.replacePrompt === "string";
+        const insert = replaceWholePrompt ? option.replacePrompt : option.insertText ?? option.label;
         replaceRange(
           textarea,
-          trigger.start,
-          trigger.end,
+          replaceWholePrompt ? 0 : trigger.start,
+          replaceWholePrompt ? textarea.value.length : trigger.end,
           insert,
           option.selectText || option.select || firstEditorPlaceholder(insert),
+          customEditing,
           customEditing,
         );
       } finally {
@@ -2996,27 +4116,35 @@ function makeController(node, nativePromptWidget) {
     },
   };
 
+  guideButton.addEventListener("pointerdown", (event) => event.stopPropagation());
+  guideButton.addEventListener("keydown", (event) => {
+    if (["Enter", " "].includes(event.key)) event.stopPropagation();
+  });
+  guideButton.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    controller.focusGuideTarget();
+  });
+
   const activateStatus = (event) => {
     if (event?.type === "keydown" && !["Enter", " "].includes(event.key)) return;
     if (event?.type === "keydown") event.preventDefault();
-    const issues = controller.validation?.issues || [];
-    if (issues.length) {
-      controller.focusDiagnostic();
-      return;
-    }
-    const notes = controller.validation?.notes || [];
-    if (!notes.length) return;
-    controller.notesExpanded = !controller.notesExpanded;
-    controller.diagnosticIndex = Math.max(0, Math.min(controller.diagnosticIndex, notes.length - 1));
-    if (controller.notesExpanded) controller.renderDiagnostic();
-    else {
-      diagnostic.classList.remove("open", "is-note");
-      diagnosticNav.classList.remove("open");
-    }
+    const { items } = controller.diagnosticItems();
+    if (!items.length) return;
+    controller.diagnosticExpanded = !controller.diagnosticExpanded;
+    controller.diagnosticIndex = Math.max(0, Math.min(controller.diagnosticIndex, items.length - 1));
+    controller.renderDiagnostic();
   };
   status.addEventListener("pointerdown", (event) => event.stopPropagation());
   status.addEventListener("click", activateStatus);
   status.addEventListener("keydown", activateStatus);
+
+  diagnosticApply.addEventListener("pointerdown", (event) => event.stopPropagation());
+  diagnosticApply.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    controller.applyDiagnosticRepair();
+  });
 
   const bindDiagnosticNavigation = (button, delta) => {
     button.addEventListener("pointerdown", (event) => {
@@ -3054,7 +4182,7 @@ function makeController(node, nativePromptWidget) {
       return;
     }
     controller.suppressAutocomplete = false;
-    controller.syncMenu();
+    controller.syncMenu(false);
   });
   textarea.addEventListener("click", () => {
     const start = Number(textarea.selectionStart) || 0;
@@ -3069,6 +4197,11 @@ function makeController(node, nativePromptWidget) {
     controller.syncMenu();
   });
   textarea.addEventListener("select", () => {
+    if (controller.menuNavigationActive) return;
+    if (controller.trigger?.kind === "starter" && textarea.value === controller.trigger.sourceText) return;
+    if (["reference-followup", "guide-target"].includes(controller.trigger?.kind)
+      && textarea.selectionStart === controller.trigger.start
+      && textarea.selectionEnd === controller.trigger.end) return;
     const state = controller.getState();
     const placeholder = editorPlaceholderAtSelection(textarea);
     if (placeholder) {
@@ -3099,21 +4232,22 @@ function makeController(node, nativePromptWidget) {
     const hasMenu = Boolean(controller.trigger?.options?.length);
     const hasSelectableMenuItem = controller.selectableIndices.length > 0;
     if (hasMenu) {
-      if (event.key === "Escape") { event.preventDefault(); controller.suppressAutocomplete = true; controller.closeMenu(); return; }
-      if (event.key === "ArrowDown" && hasSelectableMenuItem) { event.preventDefault(); moveMenuSelection(controller, 1); return; }
-      if (event.key === "ArrowUp" && hasSelectableMenuItem) { event.preventDefault(); moveMenuSelection(controller, -1); return; }
+      if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); controller.menuNavigationActive = false; controller.suppressAutocomplete = true; controller.closeMenu(); return; }
+      if (event.key === "ArrowDown" && hasSelectableMenuItem) { event.preventDefault(); event.stopPropagation(); controller.menuNavigationActive = true; moveMenuSelection(controller, 1); return; }
+      if (event.key === "ArrowUp" && hasSelectableMenuItem) { event.preventDefault(); event.stopPropagation(); controller.menuNavigationActive = true; moveMenuSelection(controller, -1); return; }
       if (event.key === "Enter" && !event.ctrlKey && !event.altKey && !event.metaKey && hasSelectableMenuItem) {
         event.preventDefault();
+        event.stopPropagation();
         controller.choose(controller.menuIndex);
         return;
       }
       if (event.key === "Tab" && !event.shiftKey && !event.ctrlKey && !event.altKey && !event.metaKey && hasSelectableMenuItem) {
         event.preventDefault();
-        // Custom is deliberately first/default, but accepting that untouched
-        // default with Tab selects the whole {field} for free-form editing.
-        // That makes ordinary keyboard traversal feel broken. Treat an untouched
-        // default Custom as "skip to next field"; once the user explicitly
-        // chooses a row with arrows/hover, Tab confirms it just like Enter.
+        event.stopPropagation();
+        // Custom is deliberately first/default. Clicking/Enter on it removes the
+        // current placeholder and leaves the caret there for free-form typing.
+        // An untouched default Custom + Tab means "skip to next field" so normal
+        // keyboard traversal does not erase fields accidentally.
         if (tabShouldAdvancePastUntouchedCustom(controller)) {
           const state = controller.getState();
           controller.closeMenu();
@@ -3167,6 +4301,11 @@ function makeController(node, nativePromptWidget) {
   textarea.addEventListener("keyup", (event) => {
     if (event.ctrlKey || event.altKey || event.metaKey) return;
     if (!["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"].includes(event.key)) return;
+    if (controller.menuNavigationActive && ["ArrowUp", "ArrowDown"].includes(event.key)) {
+      event.stopPropagation();
+      controller.menuNavigationActive = false;
+      return;
+    }
     // Keydown closes stale results before the browser moves the caret. Re-open
     // after the move when the caret actually lands inside a known {field}.
     controller.suppressAutocomplete = false;
@@ -3203,21 +4342,6 @@ function makeController(node, nativePromptWidget) {
     window.addEventListener("pointerup", finish, true);
     window.addEventListener("pointercancel", cancel, true);
     window.addEventListener("blur", cancel, true);
-  });
-
-  compiledLine.addEventListener("click", () => controller.setCompiledExpanded(!controller.compiledExpanded));
-  compiledLine.addEventListener("keydown", (event) => {
-    if (event.key !== "Enter" && event.key !== " ") return;
-    event.preventDefault();
-    controller.setCompiledExpanded(!controller.compiledExpanded);
-  });
-  compiledCopy.addEventListener("click", async (event) => {
-    event.stopPropagation();
-    const compiled = String(controller.validation?.compiledPreview || "");
-    if (!compiled) return;
-    const copied = await copyTextToClipboard(compiled);
-    compiledCopy.textContent = copied ? "Copied" : "Copy failed";
-    window.setTimeout(() => { compiledCopy.textContent = "Copy"; }, 900);
   });
 
   return controller;
@@ -3288,9 +4412,9 @@ function installPromptEditorForNode(node) {
         controller.syncFromNative(true);
         controller.scheduleRefresh(0);
       },
-      getMinHeight: () => 260,
-      getMaxHeight: () => 560,
-      getHeight: () => 300,
+      getMinHeight: () => 300 + (controller?.menuOpen ? MENU_LAYOUT_HEIGHT : 0),
+      getMaxHeight: () => 780,
+      getHeight: () => 340 + (controller?.menuOpen ? MENU_LAYOUT_HEIGHT : 0),
       hideOnZoom: false,
       selectOn: ["focus", "click"],
       serialize: false,
@@ -3300,9 +4424,9 @@ function installPromptEditorForNode(node) {
     controller.widget = widget;
     controllers.set(node, controller);
     applyFriendlyWidgetLabels(node);
+    applyFriendlyInputLabels(node);
     repairCoreWidgetDefaults(node);
     controller.invalidateExternalState();
-    controller.syncModelSourceObserver?.();
     installPromptFirstLayout(node, controller);
     attachNodeObservers(node, controller);
     hideNativePromptWidget(controller);
@@ -3312,15 +4436,73 @@ function installPromptEditorForNode(node) {
     return controller;
   } catch (error) {
     console.error("[MiniMax H3 Easy] Prompt editor enhancement failed; keeping the native ComfyUI prompt widget usable.", error);
-    restoreNativePromptWidget(controller);
+    if (controller?.dispose) controller.dispose();
+    else {
+      controller?.disposeLayout?.();
+      restoreNativePromptWidget(controller);
+      controllers.delete(node);
+    }
     if (widget && Array.isArray(node.widgets)) {
       const index = node.widgets.indexOf(widget);
       if (index >= 0) node.widgets.splice(index, 1);
     }
     controller?.wrapper?.remove?.();
-    controllers.delete(node);
     return null;
   }
+}
+
+function graphContainsLink(graph, linkId) {
+  if (linkId == null || !graph) return false;
+  const candidates = [graph.links, graph._links];
+  for (const links of candidates) {
+    if (!links) continue;
+    if (links instanceof Map) {
+      if (links.has(linkId) || links.has(String(linkId))) return true;
+      continue;
+    }
+    if (Array.isArray(links)) {
+      if (links.some((link) => link && (link.id === linkId || link[0] === linkId))) return true;
+      continue;
+    }
+    if (Object.prototype.hasOwnProperty.call(links, linkId) || Object.prototype.hasOwnProperty.call(links, String(linkId))) return true;
+  }
+  return false;
+}
+
+function clearDanglingInputLinks(node) {
+  const graph = node?.graph;
+  if (!graph || !Array.isArray(node?.inputs)) return false;
+  let repaired = false;
+  for (const input of node.inputs) {
+    const linkId = input?.link;
+    if (linkId == null || typeof linkId === "object") continue;
+    if (graphContainsLink(graph, linkId)) continue;
+    input.link = null;
+    repaired = true;
+  }
+  return repaired;
+}
+
+function scheduleWidgetRefresh(node, controller) {
+  clearTimeout(controller?.widgetRefreshTimer);
+  if (!controller) return;
+  controller.widgetRefreshTimer = window.setTimeout(() => {
+    controller.widgetRefreshTimer = null;
+    refreshControllerFromNode(node, true);
+  }, WIDGET_REFRESH_DELAY);
+}
+
+function scheduleSettledConnectionRefresh(node, controller, repairDangling = false) {
+  clearTimeout(controller?.widgetRefreshTimer);
+  clearTimeout(controller?.connectionRefreshTimer);
+  if (!controller) return;
+  controller.widgetRefreshTimer = null;
+  controller.connectionRefreshTimer = window.setTimeout(() => {
+    controller.connectionRefreshTimer = null;
+    const repaired = repairDangling ? clearDanglingInputLinks(node) : false;
+    refreshControllerFromNode(node, true);
+    if (repaired) node.graph?.setDirtyCanvas?.(true, false);
+  }, 0);
 }
 
 function refreshControllerFromNode(node, redraw = true) {
@@ -3329,15 +4511,13 @@ function refreshControllerFromNode(node, redraw = true) {
   controller.externalRefreshActive = true;
   try {
     controller.syncFromNative?.();
-    applyFriendlyWidgetLabels(node);
-    repairCoreWidgetDefaults(node);
-    syncLayoutWidgetVisibility(node, controller);
+    applyFriendlyInputLabels(node);
     controller.invalidateExternalState();
-    controller.syncModelSourceObserver?.();
+    syncLayoutWidgetVisibility(node, controller, controller.getState());
   } finally {
     controller.externalRefreshActive = false;
   }
-  if (redraw) node.graph?.setDirtyCanvas?.(true, true);
+  if (redraw) node.graph?.setDirtyCanvas?.(true, false);
   controller.scheduleRefresh(0);
 }
 
@@ -3350,22 +4530,28 @@ function attachNodeObservers(node, controller) {
 
   const changed = function (...args) {
     const result = previousChanged?.apply(this, args);
-    refreshControllerFromNode(this, true);
+    scheduleWidgetRefresh(this, controller);
     return result;
   };
   const connections = function (...args) {
     const result = previousConnections?.apply(this, args);
-    refreshControllerFromNode(this, true);
+    const connected = args[2];
+    // Refresh after native Autogrow settles. Only repair dangling link ids on
+    // an actual disconnect; doing that during connection creation can race the
+    // graph link store and erase a newly-created Reference connection.
+    scheduleSettledConnectionRefresh(this, controller, connected === false);
     return result;
   };
 
   const dispose = (restoreRemoved = true) => {
     const ctl = controllers.get(node);
     ctl?.cancelCanvasPan?.();
-    ctl?.disposeModelSourceObserver?.();
-    if (ctl) { ctl.disposeModelSourceObserver = null; ctl.modelSourceNode = null; }
+    ctl?.setMenuOpen?.(false);
     clearTimeout(ctl?.refreshTimer);
+    clearTimeout(ctl?.widgetRefreshTimer);
+    clearTimeout(ctl?.connectionRefreshTimer);
     ctl?.disposeLayout?.();
+    ctl?.menu?.remove?.();
     restoreNativePromptWidget(ctl);
     controllers.delete(node);
     if (node.onWidgetChanged === changed) node.onWidgetChanged = previousChanged;
@@ -3391,6 +4577,9 @@ function attachNodeObservers(node, controller) {
 app.registerExtension({
   name: EXTENSION,
   beforeConfigureGraph(workflow) {
+    migrateRemovedCompiledPromptOutput(workflow);
+    preserveLegacyModelSelection(workflow);
+    migrateRemovedAudioModelInput(workflow);
     migrateRemovedAdvancedSelector(workflow);
     migrateRemovedAudioProxyCanvas(workflow);
     migrateV2IntentMode(workflow);
@@ -3409,10 +4598,10 @@ app.registerExtension({
       const controller = installPromptEditorForNode(node);
       repairCoreWidgetDefaults(node);
       applyFriendlyWidgetLabels(node);
+      applyFriendlyInputLabels(node);
       if (controller) {
         controller.syncFromNative(true);
         controller.invalidateExternalState();
-        controller.syncModelSourceObserver?.();
         controller.scheduleRefresh(0);
       }
     }
@@ -3430,10 +4619,10 @@ app.registerExtension({
     const controller = installPromptEditorForNode(node);
     repairCoreWidgetDefaults(node);
     applyFriendlyWidgetLabels(node);
+    applyFriendlyInputLabels(node);
     if (controller) {
       controller.syncFromNative();
       controller.invalidateExternalState();
-      controller.syncModelSourceObserver?.();
       controller.scheduleRefresh(0);
     }
   },

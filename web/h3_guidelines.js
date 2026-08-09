@@ -1,5 +1,7 @@
 export const MODE_VIDEO = "Video + audio";
 export const MODE_AUDIO = "Audio only (32x32 proxy)";
+export const CONDITIONING_MODEL_FL2VA = "FL2VA";
+export const CONDITIONING_MODEL_REF2VA = "REF2VA";
 export const KEYFRAME_FIRST = "First frame";
 export const KEYFRAME_LAST = "Last frame";
 export const KEYFRAME_CANVAS_ADAPTIVE = "Opening frame; if absent, last frame";
@@ -46,7 +48,7 @@ export const STABLE_DIALOGUE_LANGUAGES = Object.freeze([
 // says additional dialogue languages are supported to varying degrees. Keep the
 // UI useful without pretending those additional entries are equally supported.
 // User-priority languages come first, then the rest of the stable set, then a
-// broad set of common additional languages. Custom remains available last.
+// broad set of common additional languages. The editor promotes Custom above this list at render time.
 export const DIALOGUE_LANGUAGE_OPTIONS = Object.freeze([
   "English",
   "Russian",
@@ -97,8 +99,8 @@ export const DIALOGUE_LANGUAGE_OPTIONS = Object.freeze([
 
 // [fixed value, when/why to use it, concrete example]
 export const TASK_TYPES = [
-  ["reference generation", "Reference guides content/style/action/camera; not a concrete frame, edit or continuation.", "@Image1 defines @Subject1's appearance."],
   ["keyframe completion", "Picture is a concrete first/key/last frame anchor.", "@Image1 is [Shot 1]'s first frame."],
+  ["reference generation", "Reference guides content/style/action/camera; not a concrete frame, edit or continuation.", "@Image1 defines @Subject1's appearance."],
   ["video editing", "Source video itself is modified.", "@Video1 is the footage being edited."],
   ["video continuation", "Target continues from the source ending state.", "The target continues from @Video1's ending state."],
   ["audio reuse", "Copy the actual source audio signal.", "Reuse part of @Audio1's signal."],
@@ -128,7 +130,7 @@ export const AUDIO_RETENTION = [
 // which opens its contextual menu. The validator flags any placeholder left in the final text.
 export const EDITOR_PLACEHOLDER_HELP = Object.freeze({
   "identity / appearance / structure to keep": "Open field · exact traits that must stay intact.",
-  "cut / transition": "Choose the shot change. Use camera motion instead when only distance or a slight angle changes.",
+  "cut / transition": "New-shot boundary only · prefer an ordinary cut unless a visible dissolve/fade/wipe is intentional. Use camera motion for changes inside one continuous shot.",
   "features retained": "Open field · traits that stay unchanged.",
   "features changed": "Open field · traits intentionally allowed to change.",
   "attributes": "Open field · exact traits to transfer.",
@@ -150,7 +152,7 @@ export const EDITOR_PLACEHOLDER_HELP = Object.freeze({
   "source contribution": "Open field · what this source contributes.",
   "overall action / premise": "Open field · high-level target action/premise.",
   "high-level shot progression": "Open field · major shot progression without timestamps.",
-  "visual style": "Open field · overall rendering/look.",
+  "visual style": "Open field · overall rendering/look. In Reference prompts, keep the style opening to one or two sentences before [Shot 1].",
   "lighting / color / material traits": "Open field · concrete style traits.",
   "subject / scene / composition": "Open field · visible frame anchors.",
   "pose / composition / state": "Open field · intermediate keyframe state.",
@@ -175,17 +177,17 @@ export const EDITOR_PLACEHOLDER_HELP = Object.freeze({
   "camera movement if needed": "Pick a MiniMax camera move or remove it.",
   "camera amplitude if needed": "Optional · omit, small or large.",
   "camera speed if needed": "Optional · omit, slow or fast.",
-  "dialogue language": "Preferred/common languages are offered first. H3 documents 11 as stable; additional languages may work to varying degrees, and Custom accepts any language tag.",
+  "dialogue language": "Choose or replace the [Language] tag. Quick/common tags appear first, H3 documents 11 as stable, and Custom accepts any other language with variable support.",
   "summary task type": "Reference conditioning · choose the first actual task relation.",
   "additional task type if needed": "Optional reference relation · add another or finish.",
   "visual retention": "Reference conditioning · how this tracked visual item is retained.",
   "audio retention": "Choose the fixed audio retention marker, then fill its details.",
   "define tracked reference content": "Choose what each connected reference actually means before using it elsewhere.",
-  "target video + main reference relationships": "Open field · high-level target premise, shot flow and main reference roles.",
+  "target video + main reference relationships": "One short continuous paragraph · high-level target premise, shot flow and main reference roles; do not duplicate shot-by-shot detail.",
   "retention rows for tracked references": "One row per standalone tracked definition; choose the matching visual/audio relationship.",
   "synchronized sound / dialogue if present": "Choose dialogue or diegetic sound, or remove when absent.",
-  "ambience + physical / non-verbal sounds, or N/A only if completely silent": "1–4 sentences · ambience + physical/non-verbal sound; N/A only for complete silence.",
-  "audience-only score: instrumentation + tempo/rhythm + dynamic development, or N/A": "1–3 sentences · instrumentation + tempo/rhythm + dynamics; no mood/function prose; N/A if none.",
+  "ambience + physical / non-verbal sounds, or N/A only if completely silent": "One continuous paragraph, 1–4 sentences · ambience + physical/non-verbal sound; N/A only for complete silence.",
+  "audience-only score: instrumentation + tempo/rhythm + dynamic development, or N/A": "One continuous paragraph, 1–3 sentences · instrumentation + tempo/rhythm + dynamics; no mood/function prose; N/A if none.",
   "audio events in playback order": "Audio-first mode · dialogue, lyrics, SFX, ambience, and other audible events from start to finish.",
   "audio event / timing": "Open field · exact audible event and when/how it happens.",
   "diegetic music source / performance": "Open field · music audible inside the scene, including source, instruments, rhythm and changes.",

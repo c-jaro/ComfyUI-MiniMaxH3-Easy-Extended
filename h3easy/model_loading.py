@@ -15,7 +15,6 @@ VAE_FILE_EXTENSIONS = {".safetensors"}
 NO_DIFFUSION_WEIGHTS = "<no diffusion weights found>"
 NO_TEXT_ENCODERS = "<no text encoder weights found>"
 NO_VAE_WEIGHTS = "<no VAE weights found>"
-AUTO_AUDIO_MODEL = "Auto (match conditioning)"
 SELECT_DIFFUSION_WEIGHT = "<select diffusion weight>"
 SELECT_TEXT_ENCODER = "<select text encoder>"
 SELECT_VIDEO_VAE = "<select video VAE>"
@@ -131,7 +130,7 @@ def preferred_loader_defaults(
     text_encoders: list[str],
     video_vaes: list[str],
     audio_vaes: list[str],
-) -> tuple[str, str, str, str, str, str]:
+) -> tuple[str, str, str, str, str]:
     """Legacy helper retained for tests/API callers.
 
     It returns safe defaults only. Node schema construction uses
@@ -153,7 +152,7 @@ def preferred_loader_defaults(
     _, audio_vae_default = _setup_choice(
         audio_vaes, "minimax_h3_audio_vae_fp32.safetensors", SELECT_AUDIO_VAE
     )
-    return frame_default, reference_default, text_default, video_vae_default, audio_vae_default, AUTO_AUDIO_MODEL
+    return frame_default, reference_default, text_default, video_vae_default, audio_vae_default
 
 
 def loader_selector_options(
@@ -177,11 +176,9 @@ def loader_selector_options(
     audio_vae_options, audio_vae_default = _setup_choice(
         audio_vaes, "minimax_h3_audio_vae_fp32.safetensors", SELECT_AUDIO_VAE
     )
-    audio_override_options = [AUTO_AUDIO_MODEL, *[x for x in diffusion_models if x != NO_DIFFUSION_WEIGHTS]]
     return {
         "frame": (frame_options, frame_default),
         "reference": (reference_options, reference_default),
-        "audio_override": (audio_override_options, AUTO_AUDIO_MODEL),
         "text": (text_options, text_default),
         "video_vae": (video_vae_options, video_vae_default),
         "audio_vae": (audio_vae_options, audio_vae_default),
@@ -268,33 +265,25 @@ class MiniMaxH3Bundle:
     clip: Any
     video_vae: Any
     audio_vae: Any
-    audio_model_name: str = ""
 
     def __post_init__(self) -> None:
-        if not getattr(self, "audio_model_name", ""):
-            self.audio_model_name = AUTO_AUDIO_MODEL
         self._model = None
         self._loaded_model_name = ""
         self._lock = threading.RLock()
 
-    def model_name_for(self, route: str) -> str:
-        if route not in {"fl2va", "ref2va", "audio", "audio_fl2va", "audio_ref2va"}:
+    def model_name_for(self, selection: str) -> str:
+        if selection not in {"fl2va", "ref2va"}:
             raise ValueError(
-                f"Unknown MiniMax H3 workflow route {route!r}; expected 'fl2va', 'ref2va', "
-                "'audio', 'audio_fl2va' or 'audio_ref2va'."
+                f"Unknown MiniMax H3 model selection {selection!r}; expected 'fl2va' or 'ref2va'."
             )
-        if route == "ref2va":
+        if selection == "ref2va":
             return self.ref2va_model_name
-        if route in {"audio", "audio_fl2va", "audio_ref2va"}:
-            if self.audio_model_name and self.audio_model_name != AUTO_AUDIO_MODEL:
-                return self.audio_model_name
-            return self.ref2va_model_name if route == "audio_ref2va" else self.fl2va_model_name
         return self.fl2va_model_name
 
-    def model_for(self, route: str):
-        model_name = self.model_name_for(route)
+    def model_for(self, selection: str):
+        model_name = self.model_name_for(selection)
         with self._lock:
-            # Cache by the actual file, not the workflow route. The same checkpoint
+            # Cache by the actual file, not the Model selection. The same checkpoint
             # may intentionally be selected for both text/frame and reference
             # conditioning, so changing mode must not force a needless reload.
             if self._model is not None and self._loaded_model_name == model_name:
@@ -314,21 +303,11 @@ class MiniMaxH3Bundle:
             return self._model
 
 
-def load_bundle(fl2va_model: str, ref2va_model: str, audio_model: str, text_encoder: str | None = None, video_vae: str | None = None, audio_vae: str | None = None) -> MiniMaxH3Bundle:
-    # Backward-compatible 5-argument call shape: (fl2va, ref2va, text_encoder, video_vae, audio_vae).
-    if audio_vae is None:
-        audio_vae = video_vae
-        video_vae = text_encoder
-        text_encoder = audio_model
-        audio_model = AUTO_AUDIO_MODEL
-
+def load_bundle(fl2va_model: str, ref2va_model: str, text_encoder: str, video_vae: str, audio_vae: str) -> MiniMaxH3Bundle:
     # Validate every selector before loading anything expensive, so an empty
     # model folder cannot partially allocate CLIP/VAE state before failing.
     fl2va_model = _require_real_selection(fl2va_model, "text/frame workflow diffusion weight")
     ref2va_model = _require_real_selection(ref2va_model, "reference workflow diffusion weight")
-    audio_model = str(audio_model or AUTO_AUDIO_MODEL)
-    if audio_model != AUTO_AUDIO_MODEL:
-        audio_model = _require_real_selection(audio_model, "audio-only model override")
     text_encoder = _require_real_selection(text_encoder, "text encoder weight")
     video_vae = _require_real_selection(video_vae, "video VAE weight")
     audio_vae = _require_real_selection(audio_vae, "audio VAE weight")
@@ -339,7 +318,6 @@ def load_bundle(fl2va_model: str, ref2va_model: str, audio_model: str, text_enco
     return MiniMaxH3Bundle(
         fl2va_model_name=fl2va_model,
         ref2va_model_name=ref2va_model,
-        audio_model_name=audio_model,
         clip_name=text_encoder,
         video_vae_name=video_vae,
         audio_vae_name=audio_vae,

@@ -14,6 +14,9 @@ from .model_loading import MiniMaxH3Bundle
 
 MODE_VIDEO = "Video + audio"
 MODE_AUDIO = "Audio only (32x32 proxy)"
+CONDITIONING_MODEL_FL2VA = "FL2VA"
+CONDITIONING_MODEL_REF2VA = "REF2VA"
+DEFAULT_CONDITIONING_MODEL = CONDITIONING_MODEL_FL2VA
 CANVAS_NATIVE = "768P (native)"
 CANVAS_704 = "704P (draft)"
 CANVAS_640 = "640P (draft)"
@@ -32,12 +35,12 @@ FIRST_FRAME_FIT_CROP = "Fill output (crop edges)"
 FIRST_FRAME_FIT_STRETCH = "Stretch to output (distorts)"
 # Compatibility symbol kept for older code/workflows. It is the same behavior as PAD.
 FIRST_FRAME_FIT_AUTO = FIRST_FRAME_FIT_PAD
-REF_IMAGE_MATCH = "Balanced to output area (may upscale)"
-REF_IMAGE_MAX = "2048px short-edge cap (no upscale)"
-REF_VIDEO_NATIVE = "768P native"
-REF_VIDEO_640 = "640P downscaled"
-REF_VIDEO_576 = "576P downscaled"
-REF_VIDEO_512 = "512P downscaled"
+REF_IMAGE_MATCH = "Match output area (predictable token cost)"
+REF_IMAGE_MAX = "Preserve source detail (2048px short-edge cap; slower)"
+REF_VIDEO_NATIVE = "768-class cap (most detail)"
+REF_VIDEO_640 = "640-class cap"
+REF_VIDEO_576 = "576-class cap"
+REF_VIDEO_512 = "512-class cap"
 REF_VIDEO_TEMPORAL_CORE = "Trim tail to valid H3 frame count"
 REF_VIDEO_TEMPORAL_HOLD = "Keep last frame (pad to valid H3 length)"
 
@@ -58,6 +61,10 @@ DEFAULT_CUSTOM_WIDTH = 1344
 DEFAULT_CUSTOM_HEIGHT = 768
 DEFAULT_REF_VIDEO_FPS = 24.0
 DEFAULT_REF_VIDEO_FPS_OVERRIDE = 0.0
+MIXED_INPUT_FAMILIES_ERROR = (
+    "Reference media and first/last-frame inputs cannot be combined because they use different native H3 builders. "
+    "Disconnect either every Reference input or every first/last-frame input."
+)
 
 # Exact legacy widget values accepted for workflow compatibility.
 LEGACY_MODE_BASE = "Base / Keyframes (T2VA/I2VA/FL2VA/L2VA)"
@@ -68,6 +75,7 @@ LEGACY_MODE_REFERENCE_V3 = "Reference conditioning"
 LEGACY_MODE_AUDIO = "Audio-first"
 LEGACY_MODE_AUDIO_V228 = "Audio-first proxy (T2A / A2A / V2A)"
 LEGACY_MODE_AUDIO_V229 = "Audio-first proxy (T2A / I2A / V2A / A2A)"
+REMOVED_CONDITIONING_MODELS = {"Audio override", "Audio model from Loader"}
 LEGACY_KEYFRAME_FIRST = "Image 1 = first frame"
 LEGACY_KEYFRAME_LAST = "Image 1 = last frame"
 LEGACY_KEYFRAME_CANVAS_ADAPTIVE = "Adaptive to keyframe (recommended)"
@@ -79,18 +87,25 @@ LEGACY_FIRST_FRAME_FIT_CROP = "Fill canvas (center crop)"
 LEGACY_FIRST_FRAME_FIT_STRETCH = "Allow stretch (core behavior)"
 LEGACY_REF_IMAGE_MATCH = "Auto match generation area"
 LEGACY_REF_IMAGE_MATCH_V2 = "Match output pixel area"
+LEGACY_REF_IMAGE_MATCH_BALANCED = "Balanced to output area (may upscale)"
 LEGACY_REF_IMAGE_MAX = "Max fidelity (2048px short edge)"
 LEGACY_REF_IMAGE_MAX_DETAIL = "2048px short edge (maximum detail)"
+LEGACY_REF_IMAGE_MAX_CAP = "2048px short-edge cap (no upscale)"
+LEGACY_REF_IMAGE_MAX_V4 = "Preserve source detail (2048px cap; slower)"
 LEGACY_REF_VIDEO_NATIVE = "768P native (best fidelity)"
 LEGACY_REF_VIDEO_640 = "640P balanced"
 LEGACY_REF_VIDEO_576 = "576P faster"
 LEGACY_REF_VIDEO_512 = "512P fastest"
+LEGACY_REF_VIDEO_NATIVE_V4 = "768P native"
+LEGACY_REF_VIDEO_640_V4 = "640P downscaled"
+LEGACY_REF_VIDEO_576_V4 = "576P downscaled"
+LEGACY_REF_VIDEO_512_V4 = "512P downscaled"
 LEGACY_REF_VIDEO_TEMPORAL_CORE = "Core exact: trim tail to 17k+5"
 LEGACY_REF_VIDEO_TEMPORAL_HOLD = "Preserve endpoint: hold final frame"
 
 # MiniMax's published Ref2VA envelope. These are diagnostics, not checkpoint
 # capability gates: current ComfyUI can structurally pass several combinations
-# outside this envelope, which is useful for experimental/cross-routed weights.
+# outside this envelope, which is useful for experimental cross-family weights.
 REF_MAX_IMAGES = 9
 REF_MAX_VIDEOS = 3
 REF_MAX_AUDIOS = 3
@@ -112,6 +127,7 @@ ASPECT_RATIOS: dict[str, tuple[int, int]] = {
 }
 
 MEDIA_TOKEN_RE = re.compile(r"@(?P<kind>Image|Video|Audio|Subject)(?P<index>\d+)\b", re.IGNORECASE)
+VIDEO_AUDIO_ALIAS_RE = re.compile(r"@VideoAudio(?P<index>\d+)\b", re.IGNORECASE)
 NATIVE_MEDIA_TOKEN_RE = re.compile(r"<(?P<kind>Picture|Video|Audio|Subject)\s+(?P<index>\d+)>", re.IGNORECASE)
 ANGLE_IMAGE_ALIAS_RE = re.compile(r"<Image\s+(?P<index>\d+)>", re.IGNORECASE)
 
@@ -120,6 +136,48 @@ def _selected(combo: dict[str, Any] | None, input_id: str, fallback: str) -> str
         return fallback
     value = combo.get(input_id, fallback)
     return str(value)
+
+
+def _output_mode(value: Any) -> str:
+    selected = str(value)
+    selected = {
+        LEGACY_MODE_REFERENCE: MODE_VIDEO,
+        LEGACY_MODE_REFERENCE_V2: MODE_VIDEO,
+        LEGACY_MODE_REFERENCE_V3: MODE_VIDEO,
+        LEGACY_MODE_BASE: MODE_VIDEO,
+        LEGACY_MODE_BASE_V2: MODE_VIDEO,
+        LEGACY_MODE_AUDIO: MODE_AUDIO,
+        LEGACY_MODE_AUDIO_V228: MODE_AUDIO,
+        LEGACY_MODE_AUDIO_V229: MODE_AUDIO,
+    }.get(selected, selected)
+    if selected not in {MODE_VIDEO, MODE_AUDIO}:
+        raise ValueError(f"Unknown H3 output mode {selected!r}. Choose {MODE_VIDEO!r} or {MODE_AUDIO!r}.")
+    return selected
+
+
+def _keyframe_role(value: Any) -> str:
+    selected = str(value)
+    selected = {LEGACY_KEYFRAME_FIRST: KEYFRAME_FIRST, LEGACY_KEYFRAME_LAST: KEYFRAME_LAST}.get(selected, selected)
+    if selected not in {KEYFRAME_FIRST, KEYFRAME_LAST}:
+        raise ValueError(f"Unknown Image 1 role {selected!r}. Choose {KEYFRAME_FIRST!r} or {KEYFRAME_LAST!r}.")
+    return selected
+
+
+def _conditioning_model(value: Any) -> str:
+    selected = str(value).strip()
+    selected = {
+        "Text / frame": CONDITIONING_MODEL_FL2VA,
+        "Text / first-last frames": CONDITIONING_MODEL_FL2VA,
+        "Reference conditioning": CONDITIONING_MODEL_REF2VA,
+    }.get(selected, selected)
+    if selected in REMOVED_CONDITIONING_MODELS:
+        raise ValueError("Audio override was removed because H3 has two checkpoint provisions. Choose FL2VA or REF2VA; Audio-only mode uses the selected provision.")
+    if selected not in {CONDITIONING_MODEL_FL2VA, CONDITIONING_MODEL_REF2VA}:
+        raise ValueError(
+            f"Unknown H3 model selection {selected!r}. Choose "
+            f"{CONDITIONING_MODEL_FL2VA!r} or {CONDITIONING_MODEL_REF2VA!r}."
+        )
+    return selected
 
 
 def _values_sorted(group: dict[str, Any] | None, prefix: str) -> list[tuple[str, Any]]:
@@ -143,9 +201,9 @@ def _core_ref_image_size(value: str) -> str:
     # Keep the UI descriptive while accepting the native core values for direct/API
     # callers. Unknown values fail rather than silently changing resize policy.
     selected = str(value)
-    if selected in {REF_IMAGE_MAX, LEGACY_REF_IMAGE_MAX, LEGACY_REF_IMAGE_MAX_DETAIL, "max", "2k"}:
+    if selected in {REF_IMAGE_MAX, LEGACY_REF_IMAGE_MAX, LEGACY_REF_IMAGE_MAX_DETAIL, LEGACY_REF_IMAGE_MAX_CAP, LEGACY_REF_IMAGE_MAX_V4, "max", "2k"}:
         return "max"
-    if selected in {REF_IMAGE_MATCH, LEGACY_REF_IMAGE_MATCH, LEGACY_REF_IMAGE_MATCH_V2, "match"}:
+    if selected in {REF_IMAGE_MATCH, LEGACY_REF_IMAGE_MATCH, LEGACY_REF_IMAGE_MATCH_V2, LEGACY_REF_IMAGE_MATCH_BALANCED, "match"}:
         return "match"
     raise ValueError(f"Unknown Reference image size {selected!r}. Choose {REF_IMAGE_MATCH!r} or {REF_IMAGE_MAX!r}.")
 
@@ -290,7 +348,7 @@ def _validate_native_prompt_references(
         if index <= 0:
             raise ValueError(f"{token} is invalid: H3 reference numbering is 1-based.")
         if not reference_mode and kind != "image":
-            raise ValueError(f"{token} requires connected Reference inputs. With only first/last-frame inputs, H3 exposes <Picture N> endpoint frames only.")
+            raise ValueError(f"{token} requires connected Reference inputs. With only first/last-frame inputs, H3 exposes <Picture N> frame references only.")
         if kind == "subject":
             continue
         limit = image_count if kind == "image" else video_count if kind == "video" else audio_count
@@ -301,11 +359,11 @@ def _validate_native_prompt_references(
 
 def _compile_base_prompt(prompt: str, keyframe_count: int, keyframe_role: str) -> str:
     prompt = ANGLE_IMAGE_ALIAS_RE.sub(lambda match: f"@Image{int(match.group('index'))}", str(prompt or ""))
-    if re.search(r"@(Video|Audio|Subject)\d+\b", prompt, re.IGNORECASE):
-        raise ValueError("@VideoN, @AudioN and @SubjectN require connected Reference inputs.")
+    if VIDEO_AUDIO_ALIAS_RE.search(prompt) or re.search(r"@(Video|Audio|Subject)\d+\b", prompt, re.IGNORECASE):
+        raise ValueError("@VideoN, @VideoAudioN, @AudioN and @SubjectN require connected Reference inputs.")
 
     if keyframe_count > 2:
-        raise ValueError("First/last-frame conditioning accepts at most two endpoint images.")
+        raise ValueError("First/last-frame conditioning accepts at most two frame images.")
 
     picture_map: dict[int, int] = {}
     if keyframe_count == 1:
@@ -441,6 +499,79 @@ def _reference_video_fps_by_name(mode: dict[str, Any] | None, ref_videos) -> dic
     return result
 
 
+def _reference_video_audio_enabled_by_name(mode: dict[str, Any] | None, ref_videos) -> dict[str, bool]:
+    values = mode if isinstance(mode, dict) else {}
+    result: dict[str, bool] = {}
+    for name, _video in _values_sorted(ref_videos, "ref_video_"):
+        suffix = name.rsplit("_", 1)[-1]
+        result[name] = bool(values.get(f"ref_video_use_audio_{suffix}", True))
+    return result
+
+
+
+
+def _video_parts(value: Any, fallback_fps: float = 24.0) -> tuple[torch.Tensor, dict[str, Any] | None, float]:
+    """Resolve an Easy reference-video input into frames, embedded audio and FPS.
+
+    Modern ComfyUI VIDEO values carry all three. Legacy IMAGE frame batches are
+    still accepted as silent references and use the supplied fallback rate.
+    """
+    if hasattr(value, "get_components"):
+        components = value.get_components()
+        frames = getattr(components, "images", None)
+        audio = getattr(components, "audio", None)
+        fps = getattr(components, "frame_rate", None)
+        if not isinstance(frames, torch.Tensor):
+            raise ValueError("Reference VIDEO did not provide an IMAGE frame batch.")
+        return frames, audio, _parse_reference_video_fps(fps or fallback_fps, "Reference video source FPS")
+    if isinstance(value, dict):
+        frames = value.get("images")
+        if frames is None:
+            frames = value.get("frames")
+        if isinstance(frames, torch.Tensor):
+            audio = value.get("audio")
+            fps = value.get("fps") or value.get("frame_rate") or fallback_fps
+            return frames, audio, _parse_reference_video_fps(fps, "Reference video source FPS")
+    if isinstance(value, torch.Tensor) and value.ndim == 4:
+        return value, None, _parse_reference_video_fps(fallback_fps, "Reference video source FPS")
+    raise ValueError("Reference video must be a ComfyUI VIDEO or an IMAGE frame batch.")
+
+
+def _normalize_reference_video_payloads(
+    ref_videos,
+    fallback_fps_by_name: dict[str, float] | None = None,
+    video_audio_enabled_by_name: dict[str, bool] | None = None,
+) -> tuple[dict[str, torch.Tensor], dict[str, dict[str, Any]], dict[str, float]]:
+    """Keep Easy's public video abstraction intact while feeding core's split AV inputs."""
+    fallback_fps_by_name = fallback_fps_by_name or {}
+    video_audio_enabled_by_name = video_audio_enabled_by_name or {}
+    frames_out: dict[str, torch.Tensor] = {}
+    audio_out: dict[str, dict[str, Any]] = {}
+    fps_out: dict[str, float] = {}
+    for name, value in _values_sorted(ref_videos, "ref_video_"):
+        fallback = float(fallback_fps_by_name.get(name, h3.FPS))
+        frames, soundtrack, source_fps = _video_parts(value, fallback)
+        frames_out[name] = frames
+        fps_out[name] = source_fps
+        suffix = name.rsplit("_", 1)[-1]
+        if video_audio_enabled_by_name.get(name, True) and soundtrack is not None:
+            audio_out[f"ref_video_audio_{suffix}"] = soundtrack
+    return frames_out, audio_out, fps_out
+
+
+def _video_soundtrack_native_ordinals(ref_videos, ref_video_audios) -> dict[int, int]:
+    video_ordinal_by_suffix = {
+        name.rsplit("_", 1)[-1]: ordinal
+        for ordinal, (name, _frames) in enumerate(_values_sorted(ref_videos, "ref_video_"), start=1)
+    }
+    result: dict[int, int] = {}
+    for native_audio_ordinal, (name, _audio) in enumerate(_values_sorted(ref_video_audios, "ref_video_audio_"), start=1):
+        video_ordinal = video_ordinal_by_suffix.get(name.rsplit("_", 1)[-1])
+        if video_ordinal is not None:
+            result[video_ordinal] = native_audio_ordinal
+    return result
+
+
 def _reference_video_size(mode: dict[str, Any] | None) -> str:
     values = mode if isinstance(mode, dict) else {}
     selected = str(values.get("ref_video_size", DEFAULT_REF_VIDEO_SIZE))
@@ -448,6 +579,8 @@ def _reference_video_size(mode: dict[str, Any] | None) -> str:
         "native": REF_VIDEO_NATIVE, "768": REF_VIDEO_NATIVE, "640": REF_VIDEO_640, "576": REF_VIDEO_576, "512": REF_VIDEO_512,
         LEGACY_REF_VIDEO_NATIVE: REF_VIDEO_NATIVE, LEGACY_REF_VIDEO_640: REF_VIDEO_640,
         LEGACY_REF_VIDEO_576: REF_VIDEO_576, LEGACY_REF_VIDEO_512: REF_VIDEO_512,
+        LEGACY_REF_VIDEO_NATIVE_V4: REF_VIDEO_NATIVE, LEGACY_REF_VIDEO_640_V4: REF_VIDEO_640,
+        LEGACY_REF_VIDEO_576_V4: REF_VIDEO_576, LEGACY_REF_VIDEO_512_V4: REF_VIDEO_512,
     }
     selected = aliases.get(selected, selected)
     allowed = {REF_VIDEO_NATIVE, REF_VIDEO_640, REF_VIDEO_576, REF_VIDEO_512}
@@ -488,6 +621,26 @@ def _resampled_reference_frame_count(frame_count: int, source_fps: float, target
     return max(0, int(math.floor(int(frame_count) * target_fps / source_fps + 0.5)))
 
 
+def _reference_video_resample_indices(
+    frame_count: int,
+    source_fps: float,
+    target_fps: float = 24.0,
+    *,
+    max_frames: int | None = None,
+) -> torch.Tensor:
+    n = int(frame_count)
+    scale = target_fps / source_fps
+    slots = torch.floor(torch.arange(n, dtype=torch.float64) * scale + 0.5).to(torch.long)
+    end = int(math.floor(n * scale + 0.5))
+    counts = torch.diff(torch.cat([slots, torch.tensor([end], dtype=torch.long)]))
+    indices = torch.repeat_interleave(torch.arange(n, dtype=torch.long), counts.clamp_min(0))
+    if max_frames is not None:
+        indices = indices[:max_frames]
+    if indices.numel() == 0:
+        raise ValueError(f"Reference video at {source_fps:g} fps becomes empty when resampled to {target_fps:g} fps.")
+    return indices
+
+
 def _reference_vae_frame_count(frame_count: int) -> int:
     """Exact snap-down used by current ComfyUI / official H3 reference encoding."""
     n = int(frame_count)
@@ -513,16 +666,9 @@ def _resample_reference_video_fps(
     """
     if abs(source_fps - target_fps) < 1e-9:
         return frames if max_frames is None else frames[:max_frames]
-    n = int(frames.shape[0])
-    scale = target_fps / source_fps
-    slots = torch.floor(torch.arange(n, dtype=torch.float64) * scale + 0.5).to(torch.long)
-    end = int(math.floor(n * scale + 0.5))
-    counts = torch.diff(torch.cat([slots, torch.tensor([end], dtype=torch.long)]))
-    indices = torch.repeat_interleave(torch.arange(n, dtype=torch.long), counts.clamp_min(0))
-    if max_frames is not None:
-        indices = indices[:max_frames]
-    if indices.numel() == 0:
-        raise ValueError(f"Reference video at {source_fps:g} fps becomes empty when resampled to {target_fps:g} fps.")
+    indices = _reference_video_resample_indices(
+        int(frames.shape[0]), source_fps, target_fps, max_frames=max_frames
+    )
     return frames.index_select(0, indices.to(frames.device))
 
 
@@ -532,7 +678,8 @@ def _reference_video_target(width: int, height: int, size_mode: str) -> tuple[in
     else:
         short = {REF_VIDEO_640: 640, REF_VIDEO_576: 576, REF_VIDEO_512: 512}[size_mode]
         target_w, target_h = _scaled_canvas_ratio(width, height, short)
-    # Match core H3's no-upscale behavior for video references.
+    # Avoid scaling a smaller source toward the selected class. Core H3 still
+    # rounds each edge to 32 pixels, which may slightly enlarge or reduce it.
     if width * height < target_w * target_h:
         multiple = int(getattr(h3, "CANVAS_MULTIPLE", 32))
         target_w = max(multiple, round(width / multiple) * multiple)
@@ -581,19 +728,29 @@ def _prepare_reference_videos(
         else:
             aligned_frames = core_aligned_frames
             source_needed = aligned_frames
-        # Official order is FPS normalization -> target-timeline truncation -> VAE
-        # snap-down. Core-exact mode reproduces that. Endpoint-preserve mode is an
-        # explicit wrapper option: retain every source-timeline frame, then repeat
-        # the last frame just enough to reach the next valid 17k+5 reference length.
-        normalized = _resample_reference_video_fps(
-            frames, source_fps, float(h3.FPS), max_frames=max(0, source_needed)
-        )
+        target_w, target_h = _reference_video_target(source_w, source_h, size_mode)
+        draft_downscale = size_mode != REF_VIDEO_NATIVE and source_w * source_h > target_w * target_h
+        if draft_downscale and source_fps < float(h3.FPS):
+            indices = _reference_video_resample_indices(
+                source_frames, source_fps, float(h3.FPS), max_frames=max(0, source_needed)
+            )
+            scale = float(h3.FPS) / source_fps
+            source_prefix = min(source_frames, max(1, math.ceil((source_needed - 0.5) / scale)))
+            resized_source = _resize_reference_video(frames[:source_prefix], target_w, target_h)
+            normalized = resized_source.index_select(0, indices.to(resized_source.device))
+            del resized_source
+        else:
+            normalized = _resample_reference_video_fps(
+                frames, source_fps, float(h3.FPS), max_frames=max(0, source_needed)
+            )
+        # Temporal selection and per-frame spatial resize commute. Draft mode can
+        # therefore resize low-FPS source frames once before repeating them at 24 FPS.
+        if draft_downscale and source_fps >= float(h3.FPS):
+            normalized = _resize_reference_video(normalized, target_w, target_h)
+        # Core-exact mode follows FPS normalization, timeline truncation, then VAE
+        # snap-down. Endpoint-preserve repeats the last smaller frame only as needed.
         if hold_frames and normalized.shape[0] > 0:
             normalized = torch.cat([normalized, normalized[-1:].expand(hold_frames, -1, -1, -1)], dim=0)
-        target_w, target_h = _reference_video_target(source_w, source_h, size_mode)
-        # Native mode delegates spatial normalization to core H3. Draft modes pre-downscale so core's no-upscale branch preserves the cheaper reference geometry.
-        if size_mode != REF_VIDEO_NATIVE and source_w * source_h > target_w * target_h:
-            normalized = _resize_reference_video(normalized, target_w, target_h)
         prepared[name] = normalized
         native_w, native_h = _reference_video_target(source_w, source_h, REF_VIDEO_NATIVE)
         records[name] = {
@@ -696,8 +853,39 @@ def _validate_reference_inputs(
     return image_count, video_count, audio_count
 
 
-def _compile_reference_prompt(prompt: str, image_count: int, video_count: int, audio_count: int) -> str:
+def _compile_reference_prompt(
+    prompt: str,
+    image_count: int,
+    video_count: int,
+    standalone_audio_count: int,
+    paired_soundtrack_count: int = 0,
+    video_soundtrack_ordinals: dict[int, int] | None = None,
+) -> str:
+    """Compile Easy aliases after synchronized video audio has been inspected.
+
+    @AudioN addresses only the visible standalone Reference audio inputs. Core
+    numbers embedded video soundtracks first, so standalone audio ordinals are
+    offset when a connected VIDEO contains audio. @VideoAudioN addresses the
+    enabled soundtrack belonging to visible Reference Video N.
+    """
     prompt = ANGLE_IMAGE_ALIAS_RE.sub(lambda match: f"@Image{int(match.group('index'))}", str(prompt or ""))
+    native_audio_count = int(paired_soundtrack_count) + int(standalone_audio_count)
+    video_soundtrack_ordinals = video_soundtrack_ordinals or {}
+
+    def replace_video_audio(match: re.Match[str]) -> str:
+        index = int(match.group("index"))
+        if index <= 0:
+            raise ValueError("Reference numbering is 1-based.")
+        if index > video_count:
+            raise ValueError(f"@VideoAudio{index} does not resolve: only {video_count} reference video(s) are connected.")
+        native_ordinal = video_soundtrack_ordinals.get(index)
+        if native_ordinal is None:
+            raise ValueError(
+                f"@VideoAudio{index} does not resolve: Reference Video {index} is muted or its VIDEO payload has no soundtrack."
+            )
+        return f"<Audio {native_ordinal}>"
+
+    prompt = VIDEO_AUDIO_ALIAS_RE.sub(replace_video_audio, prompt)
 
     def replace(match: re.Match[str]) -> str:
         kind = match.group("kind").lower()
@@ -715,14 +903,14 @@ def _compile_reference_prompt(prompt: str, image_count: int, video_count: int, a
                 raise ValueError(f"@Video{index} does not resolve: only {video_count} reference video(s) are connected.")
             return f"<Video {index}>"
         if kind == "audio":
-            if index > audio_count:
-                raise ValueError(f"@Audio{index} does not resolve: only {audio_count} presented audio reference(s) are connected.")
-            return f"<Audio {index}>"
+            if index > standalone_audio_count:
+                raise ValueError(f"@Audio{index} does not resolve: only {standalone_audio_count} standalone reference audio clip(s) are connected.")
+            return f"<Audio {paired_soundtrack_count + index}>"
         return match.group(0)
 
     compiled = MEDIA_TOKEN_RE.sub(replace, str(prompt or ""))
     _validate_native_prompt_references(
-        compiled, image_count, video_count, audio_count, reference_mode=True
+        compiled, image_count, video_count, native_audio_count, reference_mode=True
     )
     return compiled
 
@@ -730,7 +918,7 @@ def _compile_reference_prompt(prompt: str, image_count: int, video_count: int, a
 def _keyframes_from_group(keyframes: dict[str, Any] | None, role: str):
     values = [value for _name, value in _values_sorted(keyframes, "keyframe_")]
     if len(values) > 2:
-        raise ValueError("First/last-frame conditioning accepts at most two endpoint images.")
+        raise ValueError("First/last-frame conditioning accepts at most two frame images.")
     for ordinal, image in enumerate(values, start=1):
         if (
             not isinstance(image, torch.Tensor)
@@ -762,7 +950,9 @@ def _keyframe_canvas_policy(mode: dict[str, Any] | None) -> str:
     selected = {
         LEGACY_KEYFRAME_CANVAS_ADAPTIVE: KEYFRAME_CANVAS_ADAPTIVE,
         LEGACY_KEYFRAME_CANVAS_V2: KEYFRAME_CANVAS_ADAPTIVE,
+        "Connected first/last frame": KEYFRAME_CANVAS_ADAPTIVE,
         LEGACY_KEYFRAME_CANVAS_FIXED: KEYFRAME_CANVAS_FIXED,
+        "Aspect ratio control": KEYFRAME_CANVAS_FIXED,
     }.get(selected, selected)
     if selected not in {KEYFRAME_CANVAS_ADAPTIVE, KEYFRAME_CANVAS_FIXED}:
         raise ValueError(
@@ -802,6 +992,61 @@ def _first_frame_resize_policy(mode: dict[str, Any] | None) -> str:
 
 def _last_frame_resize_policy(mode: dict[str, Any] | None) -> str:
     return _endpoint_resize_policy(mode, "last_frame_resize", DEFAULT_LAST_FRAME_RESIZE, "last-frame")
+
+
+def validate_combo_inputs(
+    *,
+    mode: Any = None,
+    conditioning_model: Any = None,
+    canvas: Any = None,
+    keyframe_role: Any = None,
+    keyframe_canvas: Any = None,
+    first_frame_resize: Any = None,
+    last_frame_resize: Any = None,
+    ref_image_size: Any = None,
+    ref_video_size: Any = None,
+    ref_video_temporal_fit: Any = None,
+) -> bool | str:
+    values = {
+        "mode": mode,
+        "conditioning_model": conditioning_model,
+        "canvas": canvas,
+        "keyframe_role": keyframe_role,
+        "keyframe_canvas": keyframe_canvas,
+        "first_frame_resize": first_frame_resize,
+        "last_frame_resize": last_frame_resize,
+        "ref_image_size": ref_image_size,
+        "ref_video_size": ref_video_size,
+        "ref_video_temporal_fit": ref_video_temporal_fit,
+    }
+    for input_id, value in values.items():
+        if value is not None and not isinstance(value, str):
+            return f"{input_id} must be a string."
+
+    try:
+        if mode is not None:
+            _output_mode(mode)
+        if conditioning_model not in {None, ""}:
+            _conditioning_model(conditioning_model)
+        if canvas is not None:
+            resolve_canvas({"canvas": canvas, "aspect_ratio": DEFAULT_ASPECT_RATIO})
+        if keyframe_role is not None:
+            _keyframe_role(keyframe_role)
+        if keyframe_canvas is not None:
+            _keyframe_canvas_policy({"keyframe_canvas": keyframe_canvas})
+        if first_frame_resize is not None:
+            _endpoint_resize_policy({"first_frame_resize": first_frame_resize}, "first_frame_resize", DEFAULT_FIRST_FRAME_RESIZE, "first-frame")
+        if last_frame_resize is not None:
+            _endpoint_resize_policy({"last_frame_resize": last_frame_resize}, "last_frame_resize", DEFAULT_LAST_FRAME_RESIZE, "last-frame")
+        if ref_image_size is not None:
+            _core_ref_image_size(ref_image_size)
+        if ref_video_size is not None:
+            _reference_video_size({"ref_video_size": ref_video_size})
+        if ref_video_temporal_fit is not None:
+            _reference_video_temporal_fit({"ref_video_temporal_fit": ref_video_temporal_fit})
+    except ValueError as error:
+        return str(error)
+    return True
 
 
 def _to_nchw(image: torch.Tensor) -> torch.Tensor:
@@ -931,11 +1176,14 @@ def keyframe_report(
     first_frame_prefit: str | None = None,
     last_frame_resize: str = DEFAULT_LAST_FRAME_RESIZE,
     last_frame_prefit: str | None = None,
+    audio_proxy: bool = False,
 ) -> str:
     lines: list[str] = []
     selected_canvas = _selected(canvas if isinstance(canvas, dict) else {}, "canvas", DEFAULT_CANVAS)
     adaptive_active = policy == KEYFRAME_CANVAS_ADAPTIVE and selected_canvas != CANVAS_CUSTOM and (first_frame is not None or last_frame is not None)
-    if adaptive_active:
+    if audio_proxy:
+        lines.append(f"Output aspect: Audio-only uses the fixed {width}x{height} proxy.")
+    elif adaptive_active:
         anchor = first_frame if first_frame is not None else last_frame
         anchor_name = "first frame" if first_frame is not None else "last frame"
         aw, ah = _keyframe_image_size(anchor) or (0, 0)
@@ -996,8 +1244,8 @@ def keyframe_report(
         endpoint_delta = abs((fw / fh) / (lw / lh) - 1.0) * 100.0
         if endpoint_delta >= 1.0:
             lines.append(
-                f"Endpoint aspect mismatch: first {fw}x{fh}, last {lw}x{lh} ({endpoint_delta:.2f}% ratio difference). "
-                "ComfyUI's one output canvas cannot preserve both endpoint aspect ratios without cropping, padding, or distortion."
+                f"First/last-frame aspect mismatch: first {fw}x{fh}, last {lw}x{lh} ({endpoint_delta:.2f}% ratio difference). "
+                "ComfyUI's one output canvas cannot preserve both first/last-frame aspect ratios without cropping, padding, or distortion."
             )
     return "\n".join(lines)
 
@@ -1199,6 +1447,7 @@ def reference_report(
     frame_count: int,
     video_records: dict[str, dict[str, Any]] | None = None,
     audio_records: dict[str, dict[str, Any]] | None = None,
+    video_audio_enabled_by_name: dict[str, bool] | None = None,
 ) -> str:
     lines: list[str] = []
     visual_budgets: list[tuple[str, int]] = []
@@ -1223,6 +1472,7 @@ def reference_report(
     presentation: list[str] = []
     image_items = _values_sorted(ref_images, "ref_image_")
     video_items = _values_sorted(ref_videos, "ref_video_")
+    video_audio_enabled_by_name = video_audio_enabled_by_name or {}
     paired_items = dict(_values_sorted(ref_video_audios, "ref_video_audio_"))
     standalone_items = _values_sorted(ref_audios, "ref_audio_")
     for ordinal, _item in enumerate(image_items, start=1):
@@ -1232,13 +1482,20 @@ def reference_report(
         suffix = video_name.rsplit("_", 1)[-1]
         if paired_items.get(f"ref_video_audio_{suffix}") is not None:
             presented_audio_ordinal += 1
-            presentation.append(f"<Audio {presented_audio_ordinal}> (Video {ordinal} soundtrack)")
+            presentation.append(f"<Audio {presented_audio_ordinal}> (@VideoAudio{ordinal}; Video {ordinal} soundtrack)")
         presentation.append(f"<Video {ordinal}>")
-    for _name, _audio in standalone_items:
+    for standalone_ordinal, (_name, _audio) in enumerate(standalone_items, start=1):
         presented_audio_ordinal += 1
-        presentation.append(f"<Audio {presented_audio_ordinal}> (standalone)")
+        presentation.append(f"<Audio {presented_audio_ordinal}> (@Audio{standalone_ordinal}; standalone)")
     if presentation:
         lines.append("Reference presentation order: " + " -> ".join(presentation) + ".")
+    muted_videos = [
+        f"Video {ordinal}"
+        for ordinal, (name, _frames) in enumerate(video_items, start=1)
+        if not video_audio_enabled_by_name.get(name, True)
+    ]
+    if muted_videos:
+        lines.append("Reference soundtrack ignored for " + ", ".join(muted_videos) + "; visual frames and timing remain active.")
 
     for ordinal, (_name, image) in enumerate(image_items, start=1):
         if not isinstance(image, torch.Tensor) or image.ndim != 4:
@@ -1311,7 +1568,7 @@ def reference_report(
             if aspect_delta >= 3.0:
                 lines.append(
                     f"Video {ordinal} proportion warning: the reference geometry differs from the source aspect by {aspect_delta:.2f}%. "
-                    "This can happen for small inputs because current ComfyUI avoids upscaling and rounds both axes to 32-pixel multiples. "
+                    "This can happen for small inputs because current ComfyUI avoids scaling them toward the selected class but still rounds both axes to 32-pixel multiples. "
                     "Use a larger source or pre-resize upstream to a suitable 32-aligned geometry if body/shape proportions are important."
                 )
             native_w = int(rec.get("native_w", canvas_w))
@@ -1446,13 +1703,13 @@ class MiniMaxH3Context:
     video_vae: Any
     audio_vae: Any
     playback_fps: float
-    compiled_prompt: str
     width: int
     height: int
     frame_count: int
     effective_seconds: float
     mode: str
     task: str
+    conditioning_builder: str
     diffusion_model: str
     reference_info: str = ""
 
@@ -1461,19 +1718,8 @@ def generate(bundle: MiniMaxH3Bundle, mode: dict[str, Any], prompt: str, canvas:
     if not isinstance(bundle, MiniMaxH3Bundle):
         raise ValueError("Connect the H3 Bundle output from MiniMax H3 Easy Loader.")
 
-    selected_mode = _selected(mode, "mode", DEFAULT_MODE)
-    selected_mode = {
-        LEGACY_MODE_REFERENCE: MODE_VIDEO,
-        LEGACY_MODE_REFERENCE_V2: MODE_VIDEO,
-        LEGACY_MODE_REFERENCE_V3: MODE_VIDEO,
-        LEGACY_MODE_BASE: MODE_VIDEO,
-        LEGACY_MODE_BASE_V2: MODE_VIDEO,
-        LEGACY_MODE_AUDIO: MODE_AUDIO,
-        LEGACY_MODE_AUDIO_V228: MODE_AUDIO,
-        LEGACY_MODE_AUDIO_V229: MODE_AUDIO,
-    }.get(selected_mode, selected_mode)
-    if selected_mode not in {MODE_VIDEO, MODE_AUDIO}:
-        raise ValueError(f"Unknown H3 output mode {selected_mode!r}. Choose {MODE_VIDEO!r} or {MODE_AUDIO!r}.")
+    raw_selected_mode = _selected(mode, "mode", DEFAULT_MODE)
+    selected_mode = _output_mode(raw_selected_mode)
     prompt = str(prompt or "")
     length = requested_length(seconds)
     frame_count, effective_seconds, _requested = resolved_timing(seconds)
@@ -1481,33 +1727,46 @@ def generate(bundle: MiniMaxH3Bundle, mode: dict[str, Any], prompt: str, canvas:
 
     ref_images_connected = _ordered_group(mode.get("ref_images") or {}, "ref_image_")
     ref_videos_connected = _ordered_group(mode.get("ref_videos") or {}, "ref_video_")
-    ref_video_audios_connected = _ordered_group(mode.get("ref_video_audios") or {}, "ref_video_audio_")
     ref_audios_connected = _ordered_group(mode.get("ref_audios") or {}, "ref_audio_")
-    has_reference_inputs = any((ref_images_connected, ref_videos_connected, ref_video_audios_connected, ref_audios_connected))
+    has_reference_inputs = any((ref_images_connected, ref_videos_connected, ref_audios_connected))
+    keyframes_connected = _ordered_group(mode.get("keyframes") or {}, "keyframe_")
+    if has_reference_inputs and keyframes_connected:
+        raise ValueError(MIXED_INPUT_FAMILIES_ERROR)
 
-    keyframe_role_for_route = str(mode.get("keyframe_role", DEFAULT_KEYFRAME_ROLE))
-    keyframe_role_for_route = {LEGACY_KEYFRAME_FIRST: KEYFRAME_FIRST, LEGACY_KEYFRAME_LAST: KEYFRAME_LAST}.get(keyframe_role_for_route, keyframe_role_for_route)
-    _route_first, _route_last, keyframe_count_for_route = _keyframes_from_group(mode.get("keyframes") or {}, keyframe_role_for_route)
+    # Model choice and conditioning construction are independent. The selector
+    # chooses one checkpoint provisioned by Easy Loader. Physical inputs choose
+    # the native conditioning builder because only that builder can consume them.
+    model_was_omitted = mode.get("conditioning_model") is None or mode.get("conditioning_model") == ""
+    if not model_was_omitted:
+        raw_conditioning_model = str(mode.get("conditioning_model")).strip()
+    elif raw_selected_mode in {LEGACY_MODE_REFERENCE, LEGACY_MODE_REFERENCE_V2, LEGACY_MODE_REFERENCE_V3}:
+        # Old workflows explicitly encoded REF2VA in Mode before Model
+        # existed. Resolve it before the wrapper-supplied default Model value.
+        raw_conditioning_model = CONDITIONING_MODEL_REF2VA
+    elif raw_selected_mode in {LEGACY_MODE_BASE, LEGACY_MODE_BASE_V2}:
+        raw_conditioning_model = CONDITIONING_MODEL_FL2VA
+    elif raw_selected_mode in {LEGACY_MODE_AUDIO, LEGACY_MODE_AUDIO_V228, LEGACY_MODE_AUDIO_V229}:
+        raw_conditioning_model = "Audio override"
+    else:
+        raw_conditioning_model = DEFAULT_CONDITIONING_MODEL
+    model_selection = _conditioning_model(raw_conditioning_model)
 
-    # Prompt/template choice is never an execution switch. Connected media are
-    # forwarded according to the native H3 conditioning interface they belong to:
-    # Reference media use the Reference builder; otherwise endpoint/base inputs
-    # use the ImageToVideo builder. Prompt structure does not enable/disable media.
-    use_reference_route = has_reference_inputs
+    model_provision = {
+        CONDITIONING_MODEL_FL2VA: "fl2va",
+        CONDITIONING_MODEL_REF2VA: "ref2va",
+    }[model_selection]
+    diffusion_model = bundle.model_name_for(model_provision)
+    use_reference_builder = has_reference_inputs
 
-    ignored_reference_inputs = False
-    ignored_keyframe_inputs = bool(has_reference_inputs and keyframe_count_for_route)
-
-    def run_reference(route: str, task_label: str, *, audio_proxy: bool = False):
+    def run_reference(provision: str, task_label: str, *, audio_proxy: bool = False):
         width, height = (AUDIO_PROXY_WIDTH, AUDIO_PROXY_HEIGHT) if audio_proxy else resolve_canvas(canvas)
         ref_images_raw = _ordered_group(mode.get("ref_images") or {}, "ref_image_")
-        ref_videos_raw = _ordered_group(mode.get("ref_videos") or {}, "ref_video_")
-        ref_video_audios_raw = _ordered_group(mode.get("ref_video_audios") or {}, "ref_video_audio_")
+        ref_video_payloads = _ordered_group(mode.get("ref_videos") or {}, "ref_video_")
         ref_audios_raw = _ordered_group(mode.get("ref_audios") or {}, "ref_audio_")
         ref_image_size = str(mode.get("ref_image_size", DEFAULT_REF_IMAGE_SIZE))
-        if ref_image_size in {LEGACY_REF_IMAGE_MATCH, LEGACY_REF_IMAGE_MATCH_V2}:
+        if ref_image_size in {LEGACY_REF_IMAGE_MATCH, LEGACY_REF_IMAGE_MATCH_V2, LEGACY_REF_IMAGE_MATCH_BALANCED}:
             ref_image_size = REF_IMAGE_MATCH
-        elif ref_image_size in {LEGACY_REF_IMAGE_MAX, LEGACY_REF_IMAGE_MAX_DETAIL}:
+        elif ref_image_size in {LEGACY_REF_IMAGE_MAX, LEGACY_REF_IMAGE_MAX_DETAIL, LEGACY_REF_IMAGE_MAX_CAP, LEGACY_REF_IMAGE_MAX_V4}:
             ref_image_size = REF_IMAGE_MAX
         # Audio-first uses a tiny disposable target canvas. Never let ordinary
         # ``match`` shrink semantic reference images to 32x32. Balance them to
@@ -1521,24 +1780,35 @@ def generate(bundle: MiniMaxH3Bundle, mode: dict[str, Any], prompt: str, canvas:
             effective_ref_image_size = ref_image_size
             ref_balance_w, ref_balance_h = width, height
             core_ref_image_size = _core_ref_image_size(ref_image_size)
-        ref_video_fps_by_name = _reference_video_fps_by_name(mode, ref_videos_raw)
+        legacy_fps_by_name = _reference_video_fps_by_name(mode, ref_video_payloads)
+        video_audio_enabled_by_name = _reference_video_audio_enabled_by_name(mode, ref_video_payloads)
+        ref_videos_raw, embedded_video_audios_raw, ref_video_fps_by_name = _normalize_reference_video_payloads(
+            ref_video_payloads,
+            fallback_fps_by_name=legacy_fps_by_name,
+            video_audio_enabled_by_name=video_audio_enabled_by_name,
+        )
         ref_video_size = _reference_video_size(mode)
         ref_video_temporal_fit = _reference_video_temporal_fit(mode)
-        image_count, video_count, audio_count = _validate_reference_inputs(
-            ref_images_raw, ref_videos_raw, ref_video_audios_raw, ref_audios_raw, video_fps_by_name=ref_video_fps_by_name
+        image_count, video_count, _native_audio_count = _validate_reference_inputs(
+            ref_images_raw, ref_videos_raw, embedded_video_audios_raw, ref_audios_raw, video_fps_by_name=ref_video_fps_by_name
         )
         ref_images = _prepare_reference_images(ref_images_raw, ref_balance_w, ref_balance_h, effective_ref_image_size)
         ref_videos, video_records = _prepare_reference_videos(
             ref_videos_raw, ref_video_fps_by_name, ref_video_size, frame_count, ref_video_temporal_fit
         )
         ref_video_audios, paired_audio_records = _prepare_reference_audio_group(
-            ref_video_audios_raw, "ref_video_audio_", effective_seconds
+            embedded_video_audios_raw, "ref_video_audio_", effective_seconds
         )
         ref_audios, standalone_audio_records = _prepare_reference_audio_group(
             ref_audios_raw, "ref_audio_", effective_seconds
         )
+        paired_soundtrack_count = len(_values_sorted(ref_video_audios, "ref_video_audio_"))
+        standalone_audio_count = len(_values_sorted(ref_audios, "ref_audio_"))
+        video_soundtrack_ordinals = _video_soundtrack_native_ordinals(ref_videos, ref_video_audios)
         audio_records = {**paired_audio_records, **standalone_audio_records}
-        compiled = _compile_reference_prompt(prompt, image_count, video_count, audio_count)
+        compiled = _compile_reference_prompt(
+            prompt, image_count, video_count, standalone_audio_count, paired_soundtrack_count, video_soundtrack_ordinals
+        )
         core_out = h3.MiniMaxH3ReferenceToVideo.execute(
             clip=bundle.clip,
             vae=bundle.video_vae,
@@ -1554,19 +1824,16 @@ def generate(bundle: MiniMaxH3Bundle, mode: dict[str, Any], prompt: str, canvas:
             ref_audios=ref_audios,
         )
         conditioning, latent = core_out.result
-        diffusion_model = bundle.model_name_for(route)
-        model = bundle.model_for(route)
+        model = bundle.model_for(provision)
         ref_info = reference_report(
             ref_images_raw, ref_videos, ref_video_audios, ref_audios,
             ref_balance_w, ref_balance_h, effective_ref_image_size, frame_count, video_records, audio_records,
+            video_audio_enabled_by_name,
         )
-        return model, conditioning, latent, compiled, width, height, diffusion_model, ref_info, task_label
+        return model, conditioning, latent, width, height, diffusion_model, ref_info, task_label
 
-    def run_base(route: str, task_label: str, *, audio_proxy: bool = False):
-        role = str(mode.get("keyframe_role", DEFAULT_KEYFRAME_ROLE))
-        role = {LEGACY_KEYFRAME_FIRST: KEYFRAME_FIRST, LEGACY_KEYFRAME_LAST: KEYFRAME_LAST}.get(role, role)
-        if role not in {KEYFRAME_FIRST, KEYFRAME_LAST}:
-            raise ValueError(f"Unknown Image 1 role {role!r}. Choose {KEYFRAME_FIRST!r} or {KEYFRAME_LAST!r}.")
+    def run_base(provision: str, task_label: str, *, audio_proxy: bool = False):
+        role = _keyframe_role(mode.get("keyframe_role", DEFAULT_KEYFRAME_ROLE))
         first_frame, last_frame, keyframe_count = _keyframes_from_group(mode.get("keyframes") or {}, role)
         if keyframe_count == 0:
             task = task_label
@@ -1592,7 +1859,8 @@ def generate(bundle: MiniMaxH3Bundle, mode: dict[str, Any], prompt: str, canvas:
         # The explicit pad/crop/stretch policy only applies when the user forces
         # a fixed/custom output aspect.
         adaptive_endpoint_canvas = (
-            keyframe_count > 0
+            not audio_proxy
+            and keyframe_count > 0
             and keyframe_canvas == KEYFRAME_CANVAS_ADAPTIVE
             and selected_canvas != CANVAS_CUSTOM
         )
@@ -1613,46 +1881,29 @@ def generate(bundle: MiniMaxH3Bundle, mode: dict[str, Any], prompt: str, canvas:
             last_frame=prepared_last_frame,
         )
         conditioning, latent = core_out.result
-        diffusion_model = bundle.model_name_for(route)
-        model = bundle.model_for(route)
+        model = bundle.model_for(provision)
         ref_info = keyframe_report(
             first_frame, last_frame, width, height, keyframe_canvas, canvas,
             first_frame_resize, first_frame_prefit,
             last_frame_resize=last_frame_resize,
             last_frame_prefit=last_frame_prefit,
+            audio_proxy=audio_proxy,
         )
-        return model, conditioning, latent, compiled, width, height, diffusion_model, ref_info, task
+        return model, conditioning, latent, width, height, diffusion_model, ref_info, task
 
     if selected_mode == MODE_AUDIO:
-        audio_task_parts = []
-        if use_reference_route:
-            if ref_videos_connected:
-                audio_task_parts.append("V2A")
-            if ref_images_connected:
-                audio_task_parts.append("I2A")
-            if ref_video_audios_connected or ref_audios_connected:
-                audio_task_parts.append("A2A")
-        audio_task_label = "+".join(audio_task_parts) + " proxy" if audio_task_parts else "T2A proxy"
-        if use_reference_route:
-            model, conditioning, latent, compiled, width, height, diffusion_model, ref_info, task = run_reference("audio_ref2va", audio_task_label, audio_proxy=True)
+        # "Audio only" is an Easy output proxy, not a separate published H3 task.
+        audio_task_label = "Reference conditioning audio-only proxy" if use_reference_builder else "Text/frame conditioning audio-only proxy"
+        if use_reference_builder:
+            model, conditioning, latent, width, height, diffusion_model, ref_info, task = run_reference(model_provision, audio_task_label, audio_proxy=True)
             ref_info = f"Audio-only intent: H3 still generates an internal {AUDIO_PROXY_WIDTH}x{AUDIO_PROXY_HEIGHT} proxy video; decode the audio stream and discard the proxy video.\n" + ref_info
         else:
-            model, conditioning, latent, compiled, width, height, diffusion_model, ref_info, task = run_base("audio_fl2va", audio_task_label, audio_proxy=True)
+            model, conditioning, latent, width, height, diffusion_model, ref_info, task = run_base(model_provision, audio_task_label, audio_proxy=True)
             ref_info = f"Audio-only intent: H3 still generates an internal {AUDIO_PROXY_WIDTH}x{AUDIO_PROXY_HEIGHT} proxy video; decode the audio stream and discard the proxy video.\n" + ref_info if ref_info else f"Audio-only intent: H3 still generates an internal {AUDIO_PROXY_WIDTH}x{AUDIO_PROXY_HEIGHT} proxy video; decode the audio stream and discard the proxy video."
-    elif use_reference_route:
-        model, conditioning, latent, compiled, width, height, diffusion_model, ref_info, task = run_reference("ref2va", "REF2VA")
+    elif use_reference_builder:
+        model, conditioning, latent, width, height, diffusion_model, ref_info, task = run_reference(model_provision, "Reference conditioning")
     else:
-        model, conditioning, latent, compiled, width, height, diffusion_model, ref_info, task = run_base("fl2va", "T2VA")
-
-    routing_notes = []
-    if ignored_keyframe_inputs:
-        routing_notes.append(
-            "Reference inputs are connected, so execution uses the native Reference conditioning path; "
-            "first/last-frame sockets remain connected but are not forwarded by that native path."
-        )
-    if routing_notes:
-        prefix = "\n".join(routing_notes)
-        ref_info = f"{prefix}\n{ref_info}" if ref_info else prefix
+        model, conditioning, latent, width, height, diffusion_model, ref_info, task = run_base(model_provision, "T2VA")
 
     context = MiniMaxH3Context(
         conditioning=conditioning,
@@ -1660,14 +1911,14 @@ def generate(bundle: MiniMaxH3Bundle, mode: dict[str, Any], prompt: str, canvas:
         video_vae=bundle.video_vae,
         audio_vae=bundle.audio_vae,
         playback_fps=out_fps,
-        compiled_prompt=compiled,
         width=width,
         height=height,
         frame_count=frame_count,
         effective_seconds=effective_seconds,
         mode=selected_mode,
         task=task,
+        conditioning_builder="Reference" if use_reference_builder else "Text / first-last frames",
         diffusion_model=diffusion_model,
         reference_info=ref_info,
     )
-    return model, context, compiled
+    return model, context

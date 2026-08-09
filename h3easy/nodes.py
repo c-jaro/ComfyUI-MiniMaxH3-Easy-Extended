@@ -30,6 +30,9 @@ from .runtime import (
     FIRST_FRAME_FIT_STRETCH,
     MODE_VIDEO,
     MODE_AUDIO,
+    CONDITIONING_MODEL_FL2VA,
+    CONDITIONING_MODEL_REF2VA,
+    DEFAULT_CONDITIONING_MODEL,
     REF_IMAGE_MATCH,
     REF_IMAGE_MAX,
     REF_VIDEO_NATIVE,
@@ -52,10 +55,10 @@ from .runtime import (
     DEFAULT_ASPECT_RATIO,
     DEFAULT_CUSTOM_WIDTH,
     DEFAULT_CUSTOM_HEIGHT,
-    DEFAULT_REF_VIDEO_FPS,
-    DEFAULT_REF_VIDEO_FPS_OVERRIDE,
+    MIXED_INPUT_FAMILIES_ERROR,
     MiniMaxH3Context,
     generate,
+    validate_combo_inputs,
 )
 
 CATEGORY = "MiniMax H3 Easy"
@@ -83,7 +86,7 @@ def _keyframe_inputs() -> list[io.Input]:
             "keyframes",
             display_name="First/last frame images",
             optional=True,
-            tooltip="Endpoint conditioning. Leave empty for text-only; one image = first or last frame; two = both endpoints. Audio only keeps this base route active, but the visual target is only 32x32; Reference images preserve substantially more visual conditioning detail.",
+            tooltip="First/last-frame conditioning when no Reference media is connected. Leave empty for text-only; one image can be the first or last frame; two images provide both. Audio-only feeds endpoint frames through its 32x32 proxy, so Reference images preserve substantially more visual guidance detail.",
             template=io.Autogrow.TemplatePrefix(
                 input=io.Image.Input("keyframe", tooltip="Connect a first-frame or last-frame image."),
                 prefix="keyframe_",
@@ -96,21 +99,21 @@ def _keyframe_inputs() -> list[io.Input]:
             display_name="Image 1 is",
             options=[KEYFRAME_FIRST, KEYFRAME_LAST],
             default=DEFAULT_KEYFRAME_ROLE,
-            tooltip="Video + audio only. With 2 endpoint images, Image 2 is the opposite endpoint.",
+            tooltip="Sets Image 1's endpoint role. With 2 frame images, Image 2 is the opposite endpoint.",
         ),
         io.Combo.Input(
             "keyframe_canvas",
             display_name="Video aspect ratio source",
             options=[KEYFRAME_CANVAS_ADAPTIVE, KEYFRAME_CANVAS_FIXED],
             default=DEFAULT_KEYFRAME_CANVAS,
-            tooltip="Video + audio only. Follow the endpoint-frame proportions, or use Output aspect ratio.",
+            tooltip="Video + audio only. Follow the first/last-frame proportions, or use Output aspect ratio.",
         ),
         io.Combo.Input(
             "first_frame_resize",
             display_name="Opening frame resize",
             options=[FIRST_FRAME_FIT_PAD, FIRST_FRAME_FIT_CROP, FIRST_FRAME_FIT_STRETCH],
             default=DEFAULT_FIRST_FRAME_RESIZE,
-            tooltip="Video + audio only. Keep, crop, or stretch the opening endpoint when its aspect differs from the output.",
+            tooltip="When the output aspect is fixed, keep, crop, or stretch the opening frame. Audio-only applies this policy against its 32x32 proxy.",
         ),
     ]
 
@@ -122,7 +125,7 @@ def _reference_inputs() -> list[io.Input]:
             display_name="Reference image resolution",
             options=[REF_IMAGE_MATCH, REF_IMAGE_MAX],
             default=DEFAULT_REF_IMAGE_SIZE,
-            tooltip="Balanced to output area is an Easy policy that may upscale or downscale a still reference toward the output pixel area without stretching. The 2048px option follows current core's no-upscale cap and can be much heavier.",
+            tooltip="Match output area gives each still roughly the output's pixel area for predictable conditioning-token cost. It may enlarge a small source, but enlargement creates no detail and can soften pixels. Preserve source detail does not intentionally upscale; it retains available source pixels up to the 2048px short-edge cap and can be much slower.",
         ),
         io.Autogrow.Input(
             "ref_images",
@@ -140,36 +143,7 @@ def _reference_inputs() -> list[io.Input]:
             display_name="Reference video resolution",
             options=[REF_VIDEO_NATIVE, REF_VIDEO_640, REF_VIDEO_576, REF_VIDEO_512],
             default=DEFAULT_REF_VIDEO_SIZE,
-            tooltip="Native 768P keeps the most reference detail. Lower values reduce reference cost.",
-        ),
-        io.Float.Input(
-            "ref_video_fps",
-            display_name="Video 1 source FPS",
-            default=DEFAULT_REF_VIDEO_FPS,
-            min=1.0,
-            max=240.0,
-            step=0.001,
-            tooltip="FPS represented by Video 1. Video 2/3 use this too when their source FPS is 0.",
-        ),
-        io.Float.Input(
-            "ref_video_fps_2",
-            display_name="Video 2 source FPS",
-            optional=True,
-            default=DEFAULT_REF_VIDEO_FPS_OVERRIDE,
-            min=0.0,
-            max=240.0,
-            step=0.001,
-            tooltip="0 = same as Video 1.",
-        ),
-        io.Float.Input(
-            "ref_video_fps_3",
-            display_name="Video 3 source FPS",
-            optional=True,
-            default=DEFAULT_REF_VIDEO_FPS_OVERRIDE,
-            min=0.0,
-            max=240.0,
-            step=0.001,
-            tooltip="0 = same as Video 1.",
+            tooltip="Caps reference-video geometry at the selected H3 resolution class without scaling a smaller source toward that class. H3 still rounds each edge to the nearest 32 pixels, which can slightly enlarge or reduce an edge. Lower classes reduce conditioning cost only when the source exceeds that cap; they can weaken fine motion, small details, or identity cues.",
         ),
         io.Combo.Input(
             "ref_video_temporal_fit",
@@ -182,22 +156,14 @@ def _reference_inputs() -> list[io.Input]:
             "ref_videos",
             display_name="Reference videos",
             optional=True,
-            tooltip="Reference video frame batches. Each clip is normalized independently to H3's 24 fps timeline.",
+            tooltip="Reference VIDEO inputs. Easy reads source frame rate and uses an exposed synchronized soundtrack only while that video's Use soundtrack control is enabled. Silent videos are valid. IMAGE frame batches are also accepted as legacy 24 fps silent references.",
             template=io.Autogrow.TemplatePrefix(
-                input=io.Image.Input("ref_video", tooltip="Reference-video IMAGE batch."),
+                input=io.MultiType.Input(
+                    "ref_video",
+                    types=[io.Video, io.Image],
+                    tooltip="Reference video. VIDEO may carry a synchronized soundtrack and source frame rate; the per-video Use soundtrack control decides whether audio is conditioned. Legacy IMAGE frame batches are treated as silent 24 fps video.",
+                ),
                 prefix="ref_video_",
-                min=0,
-                max=3,
-            ),
-        ),
-        io.Autogrow.Input(
-            "ref_video_audios",
-            display_name="Audio paired with reference videos",
-            optional=True,
-            tooltip="Socket N pairs with Video N. Prompt <Audio N> numbering is independent and follows presentation order.",
-            template=io.Autogrow.TemplatePrefix(
-                input=io.Audio.Input("ref_video_audio", tooltip="Soundtrack paired by socket number with the corresponding reference video; prompt Audio numbering is independent"),
-                prefix="ref_video_audio_",
                 min=0,
                 max=3,
             ),
@@ -206,9 +172,9 @@ def _reference_inputs() -> list[io.Input]:
             "ref_audios",
             display_name="Standalone reference audio",
             optional=True,
-            tooltip="Standalone reference audio. Autogrow adds another socket as you connect them, up to 3 clips; use separate clips for separate voice references.",
+            tooltip="Standalone reference audio. Autogrow adds another socket as you connect them, up to 3 clips; use separate clips for separate audio roles or references.",
             template=io.Autogrow.TemplatePrefix(
-                input=io.Audio.Input("ref_audio", tooltip="One standalone audio/voice reference. Connect it to reveal the next socket; up to 3 are supported."),
+                input=io.Audio.Input("ref_audio", tooltip="One standalone audio reference. Connect it to reveal the next socket; up to 3 are supported."),
                 prefix="ref_audio_",
                 min=0,
                 max=3,
@@ -224,14 +190,14 @@ def _canvas_inputs() -> list[io.Input]:
             display_name="Output resolution",
             options=[CANVAS_NATIVE, CANVAS_704, CANVAS_640, CANVAS_576, CANVAS_512, CANVAS_CUSTOM],
             default=DEFAULT_CANVAS,
-            tooltip="Video + audio output canvas. Easy shows the current megapixel count in the row label; endpoint-driven aspect ratios show the resolution-class approximation because the source-frame aspect is resolved at execution. Audio-only always uses its internal 32x32 proxy and ignores this setting.",
+            tooltip="Video + audio output canvas. 768P and the draft values name H3 resolution classes; the resolved edge lengths depend on aspect ratio. Easy shows the current dimensions and megapixel count in the row label; first/last-frame-driven aspect ratios show a theoretical pre-alignment resolution-class range until execution resolves the source aspect. Custom exact values are rounded to the nearest 32 pixels. Audio-only always uses its internal 32x32 proxy and ignores this setting.",
         ),
         io.Combo.Input(
             "aspect_ratio",
             display_name="Output aspect ratio",
             options=list(ASPECT_RATIOS),
             default=DEFAULT_ASPECT_RATIO,
-            tooltip="Video + audio only. Used by non-Custom resolutions unless Video aspect ratio source follows an endpoint frame.",
+            tooltip="Video + audio only. Used by non-Custom resolutions unless Video aspect ratio source follows a first/last frame.",
         ),
         io.Int.Input(
             "width",
@@ -240,7 +206,7 @@ def _canvas_inputs() -> list[io.Input]:
             min=32,
             max=nodes.MAX_RESOLUTION,
             step=32,
-            tooltip="Video + audio only; used when Output resolution is Custom exact.",
+            tooltip="Video + audio only; used when Output resolution is Custom exact and rounded to the nearest 32 pixels.",
         ),
         io.Int.Input(
             "height",
@@ -249,7 +215,7 @@ def _canvas_inputs() -> list[io.Input]:
             min=32,
             max=nodes.MAX_RESOLUTION,
             step=32,
-            tooltip="Video + audio only; used when Output resolution is Custom exact.",
+            tooltip="Video + audio only; used when Output resolution is Custom exact and rounded to the nearest 32 pixels.",
         ),
     ]
 
@@ -263,7 +229,6 @@ class MiniMaxH3EasyLoader(io.ComfyNode):
         selectors = loader_selector_options(diffusion_models, text_encoders, video_vaes, audio_vaes)
         frame_options, frame_default = selectors["frame"]
         reference_options, reference_default = selectors["reference"]
-        audio_options, audio_default = selectors["audio_override"]
         text_options, text_default = selectors["text"]
         video_vae_options, video_vae_default = selectors["video_vae"]
         audio_vae_options, audio_vae_default = selectors["audio_vae"]
@@ -272,23 +237,23 @@ class MiniMaxH3EasyLoader(io.ComfyNode):
             display_name="MiniMax H3 Easy Loader",
             category=CATEGORY,
             description=(
-                "Select the two conditioning models plus shared H3 components. Audio-only automatically reuses the matching conditioning model unless an override is selected. "
+                "Provision FL2VA and REF2VA checkpoints plus shared H3 components. The Easy node's Model control explicitly chooses which provision runs. "
                 "Every loadable safetensors/GGUF remains selectable; filenames are never capability gates."
             ),
             inputs=[
                 io.Combo.Input(
                     "fl2va_model",
-                    display_name="Text / frame model",
+                    display_name="FL2VA checkpoint",
                     options=frame_options,
                     default=frame_default,
-                    tooltip="Used for text-only and first/last-frame conditioning.",
+                    tooltip="Checkpoint provision selected by FL2VA on the Easy node. Connected inputs independently choose the native conditioning builder.",
                 ),
                 io.Combo.Input(
                     "ref2va_model",
-                    display_name="Reference conditioning model",
+                    display_name="REF2VA checkpoint",
                     options=reference_options,
                     default=reference_default,
-                    tooltip="Used whenever Reference image/video/audio inputs are connected. Prompt structure only changes assistance/validation; it does not disable connected references.",
+                    tooltip="Checkpoint provision selected by REF2VA on the Easy node. Connected inputs independently choose the native conditioning builder.",
                 ),
                 io.Combo.Input(
                     "text_encoder",
@@ -311,22 +276,14 @@ class MiniMaxH3EasyLoader(io.ComfyNode):
                     default=audio_vae_default,
                     tooltip="Shared H3 audio VAE.",
                 ),
-                io.Combo.Input(
-                    "audio_model",
-                    display_name="Audio-only model override",
-                    options=audio_options,
-                    default=audio_default,
-                    tooltip="Auto uses the Text/frame or Reference model selected by the current connected conditioning inputs. Select a file only to force a separate audio-only model.",
-                    advanced=True,
-                ),
             ],
             outputs=[BundleIO.Output("h3_bundle", display_name="H3 Bundle")],
             search_aliases=["minimax h3 loader", "h3 easy loader"],
         )
 
     @classmethod
-    def execute(cls, fl2va_model, ref2va_model, audio_model, text_encoder, video_vae, audio_vae) -> io.NodeOutput:
-        return io.NodeOutput(load_bundle(fl2va_model, ref2va_model, audio_model, text_encoder, video_vae, audio_vae))
+    def execute(cls, fl2va_model, ref2va_model, text_encoder, video_vae, audio_vae) -> io.NodeOutput:
+        return io.NodeOutput(load_bundle(fl2va_model, ref2va_model, text_encoder, video_vae, audio_vae))
 
 
 class MiniMaxH3Easy(io.ComfyNode):
@@ -337,8 +294,8 @@ class MiniMaxH3Easy(io.ComfyNode):
             display_name="MiniMax H3 Easy",
             category=CATEGORY,
             description=(
-                "Static-input MiniMax H3 frontend. Mode only chooses normal video+audio versus audio-only output intent; "
-                "prompt templates only change editor assistance. Connected media stay active independently of the chosen prompt template."
+                "MiniMax H3 frontend with native Autogrow media inputs. Model selects a checkpoint provisioned by Easy Loader; "
+                "connected Reference media choose Reference conditioning, otherwise text/first-last-frame conditioning is used."
             ),
             inputs=[
                 BundleIO.Input("h3_bundle", display_name="H3 Bundle"),
@@ -347,7 +304,7 @@ class MiniMaxH3Easy(io.ComfyNode):
                     display_name="Mode",
                     options=[MODE_VIDEO, MODE_AUDIO],
                     default=DEFAULT_MODE,
-                    tooltip="Only output intent: normal video+audio or audio-only 32x32 proxy. Prompt templates only affect editor assistance; they never enable, disable, or reroute connected media.",
+                    tooltip="Only output intent: normal video+audio or audio-only 32x32 proxy. A starter can set this and the endpoint role, but never changes Model, connections, or which connected media activate conditioning.",
                 ),
                 *_canvas_inputs(),
                 io.Float.Input(
@@ -369,22 +326,86 @@ class MiniMaxH3Easy(io.ComfyNode):
                     display_name="Ending frame resize",
                     options=[FIRST_FRAME_FIT_PAD, FIRST_FRAME_FIT_CROP, FIRST_FRAME_FIT_STRETCH],
                     default=DEFAULT_LAST_FRAME_RESIZE,
-                    tooltip="Video + audio only. Current core H3 center-crops a mismatched ending frame. Preserve full frame pads it before conditioning; Stretch is available only when distortion is intentional.",
+                    tooltip="Current core H3 center-crops a mismatched ending frame. Preserve full frame pads it before conditioning; Stretch is available only when distortion is intentional. Audio-only applies this policy against its 32x32 proxy.",
                 ),
+                # Append-only model selector. The frontend moves this above Mode so
+                # legacy widget indices remain stable.
+                io.Combo.Input(
+                    "conditioning_model",
+                    display_name="Model",
+                    options=[CONDITIONING_MODEL_FL2VA, CONDITIONING_MODEL_REF2VA],
+                    default=DEFAULT_CONDITIONING_MODEL,
+                    optional=True,
+                    tooltip="FL2VA or REF2VA checkpoint provision from MiniMax H3 Easy Loader. This does not filter inputs: connected Reference media choose the native Reference builder; otherwise text/first-last-frame conditioning is used. Audio-only uses the selected provision.",
+                ),
+                # Append-only per-slot policies. They stay optional so workflows
+                # saved before these controls preserve the former use-audio path.
+                *[
+                    io.Boolean.Input(
+                        f"ref_video_use_audio_{index}",
+                        display_name=f"Use Video {index + 1} soundtrack",
+                        default=True,
+                        optional=True,
+                        label_on="Use audio",
+                        label_off="Muted",
+                        tooltip=f"When muted, Reference video {index + 1} keeps its frames and timing but its embedded soundtrack is excluded from H3 conditioning.",
+                    )
+                    for index in range(3)
+                ],
             ],
             outputs=[
                 io.Model.Output("model", display_name="Model"),
                 ContextIO.Output("h3_context", display_name="H3 Context"),
-                io.String.Output("compiled_prompt", display_name="Compiled Prompt"),
             ],
             search_aliases=["minimax h3", "h3", "hailuo h3", "ref2va", "fl2va", "t2a", "v2a"],
         )
+
+    @classmethod
+    def validate_inputs(
+        cls,
+        mode=None,
+        canvas=None,
+        keyframe_role=None,
+        keyframe_canvas=None,
+        first_frame_resize=None,
+        ref_image_size=None,
+        ref_video_size=None,
+        ref_video_temporal_fit=None,
+        last_frame_resize=None,
+        conditioning_model=None,
+        keyframes=None,
+        ref_images=None,
+        ref_videos=None,
+        ref_audios=None,
+    ) -> bool | str:
+        validation = validate_combo_inputs(
+            mode=mode,
+            canvas=canvas,
+            keyframe_role=keyframe_role,
+            keyframe_canvas=keyframe_canvas,
+            first_frame_resize=first_frame_resize,
+            ref_image_size=ref_image_size,
+            ref_video_size=ref_video_size,
+            ref_video_temporal_fit=ref_video_temporal_fit,
+            last_frame_resize=last_frame_resize,
+            conditioning_model=conditioning_model,
+        )
+        if validation is not True:
+            return validation
+
+        def connected(group) -> bool:
+            return isinstance(group, dict) and any(value is not None for value in group.values())
+
+        if connected(keyframes) and any(connected(group) for group in (ref_images, ref_videos, ref_audios)):
+            return MIXED_INPUT_FAMILIES_ERROR
+        return True
 
     @classmethod
     def execute(
         cls,
         h3_bundle,
         mode=DEFAULT_MODE,
+        conditioning_model=None,
         keyframes=None,
         keyframe_role=DEFAULT_KEYFRAME_ROLE,
         keyframe_canvas=DEFAULT_KEYFRAME_CANVAS,
@@ -392,12 +413,8 @@ class MiniMaxH3Easy(io.ComfyNode):
         ref_image_size=DEFAULT_REF_IMAGE_SIZE,
         ref_images=None,
         ref_video_size=DEFAULT_REF_VIDEO_SIZE,
-        ref_video_fps=DEFAULT_REF_VIDEO_FPS,
-        ref_video_fps_2=DEFAULT_REF_VIDEO_FPS_OVERRIDE,
-        ref_video_fps_3=DEFAULT_REF_VIDEO_FPS_OVERRIDE,
         ref_video_temporal_fit=DEFAULT_REF_VIDEO_TEMPORAL_FIT,
         ref_videos=None,
-        ref_video_audios=None,
         ref_audios=None,
         canvas=DEFAULT_CANVAS,
         aspect_ratio=DEFAULT_ASPECT_RATIO,
@@ -406,9 +423,13 @@ class MiniMaxH3Easy(io.ComfyNode):
         seconds=DEFAULT_SECONDS,
         prompt="",
         last_frame_resize=DEFAULT_LAST_FRAME_RESIZE,
+        ref_video_use_audio_0=True,
+        ref_video_use_audio_1=True,
+        ref_video_use_audio_2=True,
     ) -> io.NodeOutput:
         mode_payload = {
             "mode": mode,
+            "conditioning_model": conditioning_model,
             "keyframes": keyframes or {},
             "keyframe_role": keyframe_role,
             "keyframe_canvas": keyframe_canvas,
@@ -417,12 +438,11 @@ class MiniMaxH3Easy(io.ComfyNode):
             "ref_image_size": ref_image_size,
             "ref_images": ref_images or {},
             "ref_video_size": ref_video_size,
-            "ref_video_fps": ref_video_fps,
-            "ref_video_fps_2": ref_video_fps_2,
-            "ref_video_fps_3": ref_video_fps_3,
             "ref_video_temporal_fit": ref_video_temporal_fit,
             "ref_videos": ref_videos or {},
-            "ref_video_audios": ref_video_audios or {},
+            "ref_video_use_audio_0": ref_video_use_audio_0,
+            "ref_video_use_audio_1": ref_video_use_audio_1,
+            "ref_video_use_audio_2": ref_video_use_audio_2,
             "ref_audios": ref_audios or {},
         }
         canvas_payload = {
@@ -431,8 +451,8 @@ class MiniMaxH3Easy(io.ComfyNode):
             "width": width,
             "height": height,
         }
-        model, context, compiled = generate(h3_bundle, mode_payload, prompt, canvas_payload, seconds, DEFAULT_PLAYBACK_FPS)
-        return io.NodeOutput(model, context, compiled)
+        model, context = generate(h3_bundle, mode_payload, prompt, canvas_payload, seconds, DEFAULT_PLAYBACK_FPS)
+        return io.NodeOutput(model, context)
 
 
 class MiniMaxH3EasyOutput(io.ComfyNode):
@@ -518,9 +538,10 @@ class MiniMaxH3EasyInfo(io.ComfyNode):
             raise ValueError("Connect the H3 Context output from MiniMax H3 Easy.")
         conditioning_label = h3_context.task
         lines = [
-            f"Conditioning: {conditioning_label}",
+            f"Conditioning builder: {h3_context.conditioning_builder}",
+            f"Task: {conditioning_label}",
             f"Diffusion model: {h3_context.diffusion_model}",
-            f"Output: {h3_context.width}x{h3_context.height}",
+            f"Output: {h3_context.width}x{h3_context.height} ({h3_context.width * h3_context.height / 1_000_000:.3f} MP)",
             f"H3 timeline: {h3_context.frame_count} frames @ 24 fps = {h3_context.effective_seconds:.3f} s",
             f"Playback FPS: {h3_context.playback_fps:g}",
         ]
@@ -558,18 +579,13 @@ class MiniMaxH3EasyExtension(ComfyExtension):
                 {"new_id": "ref_image_size", "old_id": "ref_image_size"},
                 {"new_id": "ref_images", "old_id": "ref_images"},
                 {"new_id": "ref_video_size", "old_id": "ref_video_size"},
-                {"new_id": "ref_video_fps", "old_id": "ref_video_fps"},
-                {"new_id": "ref_video_fps_2", "old_id": "ref_video_fps_2"},
-                {"new_id": "ref_video_fps_3", "old_id": "ref_video_fps_3"},
                 {"new_id": "ref_video_temporal_fit", "old_id": "ref_video_temporal_fit"},
                 {"new_id": "ref_videos", "old_id": "ref_videos"},
-                {"new_id": "ref_video_audios", "old_id": "ref_video_audios"},
                 {"new_id": "ref_audios", "old_id": "ref_audios"},
             ],
             output_mapping=[
                 {"new_idx": 0, "old_idx": 0},
                 {"new_idx": 1, "old_idx": 1},
-                {"new_idx": 2, "old_idx": 2},
             ],
         ))
 
@@ -593,18 +609,13 @@ class MiniMaxH3EasyExtension(ComfyExtension):
                 {"new_id": "ref_image_size", "old_id": "mode.ref_image_size"},
                 {"new_id": "ref_images", "old_id": "mode.ref_images"},
                 {"new_id": "ref_video_size", "old_id": "mode.ref_video_size"},
-                {"new_id": "ref_video_fps", "old_id": "mode.ref_video_fps"},
-                {"new_id": "ref_video_fps_2", "old_id": "mode.ref_video_fps_2"},
-                {"new_id": "ref_video_fps_3", "old_id": "mode.ref_video_fps_3"},
                 {"new_id": "ref_video_temporal_fit", "old_id": "mode.ref_video_temporal_fit"},
                 {"new_id": "ref_videos", "old_id": "mode.ref_videos"},
-                {"new_id": "ref_video_audios", "old_id": "mode.ref_video_audios"},
                 {"new_id": "ref_audios", "old_id": "mode.ref_audios"},
             ],
             output_mapping=[
                 {"new_idx": 0, "old_idx": 0},
                 {"new_idx": 1, "old_idx": 1},
-                {"new_idx": 2, "old_idx": 2},
             ],
         ))
 
@@ -626,13 +637,16 @@ class MiniMaxH3EasyExtension(ComfyExtension):
                 {"new_id": "height", "old_id": "height"},
                 {"new_id": "seconds", "old_id": "seconds"},
                 {"new_id": "keyframe_role", "old_id": "keyframe_role"},
+                {"new_id": "keyframe_canvas", "set_value": DEFAULT_KEYFRAME_CANVAS},
+                {"new_id": "first_frame_resize", "set_value": DEFAULT_FIRST_FRAME_RESIZE},
                 {"new_id": "last_frame_resize", "set_value": DEFAULT_LAST_FRAME_RESIZE},
                 {"new_id": "ref_image_size", "old_id": "ref_image_size"},
+                {"new_id": "ref_video_size", "set_value": DEFAULT_REF_VIDEO_SIZE},
+                {"new_id": "ref_video_temporal_fit", "set_value": DEFAULT_REF_VIDEO_TEMPORAL_FIT},
             ],
             output_mapping=[
                 {"new_idx": 0, "old_idx": 0},
                 {"new_idx": 1, "old_idx": 1},
-                {"new_idx": 2, "old_idx": 2},
             ],
         ))
 
