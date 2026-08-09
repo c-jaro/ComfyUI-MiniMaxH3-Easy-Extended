@@ -50,6 +50,8 @@ from .runtime import (
     DEFAULT_REF_IMAGE_SIZE,
     DEFAULT_REF_VIDEO_SIZE,
     DEFAULT_REF_VIDEO_TEMPORAL_FIT,
+    DEFAULT_REF_VIDEO_FPS,
+    DEFAULT_REF_VIDEO_FPS_OVERRIDE,
     DEFAULT_SECONDS,
     DEFAULT_PLAYBACK_FPS,
     DEFAULT_ASPECT_RATIO,
@@ -352,6 +354,38 @@ class MiniMaxH3Easy(io.ComfyNode):
                     )
                     for index in range(3)
                 ],
+                # Append-only V2 migration state. Modern VIDEO values carry their
+                # own frame rate, so the frontend keeps these IMAGE-batch fallbacks hidden.
+                io.Float.Input(
+                    "ref_video_fps",
+                    display_name="Legacy Video 1 source FPS",
+                    default=DEFAULT_REF_VIDEO_FPS,
+                    min=0.01,
+                    max=240.0,
+                    step=0.01,
+                    optional=True,
+                    tooltip="Legacy IMAGE-batch fallback only. Modern VIDEO inputs carry their own source frame rate.",
+                ),
+                io.Float.Input(
+                    "ref_video_fps_2",
+                    display_name="Legacy Video 2 source FPS",
+                    default=DEFAULT_REF_VIDEO_FPS_OVERRIDE,
+                    min=0.0,
+                    max=240.0,
+                    step=0.01,
+                    optional=True,
+                    tooltip="Legacy IMAGE-batch override. Zero inherits Video 1; modern VIDEO inputs carry their own frame rate.",
+                ),
+                io.Float.Input(
+                    "ref_video_fps_3",
+                    display_name="Legacy Video 3 source FPS",
+                    default=DEFAULT_REF_VIDEO_FPS_OVERRIDE,
+                    min=0.0,
+                    max=240.0,
+                    step=0.01,
+                    optional=True,
+                    tooltip="Legacy IMAGE-batch override. Zero inherits Video 1; modern VIDEO inputs carry their own frame rate.",
+                ),
             ],
             outputs=[
                 io.Model.Output("model", display_name="Model"),
@@ -426,6 +460,9 @@ class MiniMaxH3Easy(io.ComfyNode):
         ref_video_use_audio_0=True,
         ref_video_use_audio_1=True,
         ref_video_use_audio_2=True,
+        ref_video_fps=DEFAULT_REF_VIDEO_FPS,
+        ref_video_fps_2=DEFAULT_REF_VIDEO_FPS_OVERRIDE,
+        ref_video_fps_3=DEFAULT_REF_VIDEO_FPS_OVERRIDE,
     ) -> io.NodeOutput:
         mode_payload = {
             "mode": mode,
@@ -443,6 +480,9 @@ class MiniMaxH3Easy(io.ComfyNode):
             "ref_video_use_audio_0": ref_video_use_audio_0,
             "ref_video_use_audio_1": ref_video_use_audio_1,
             "ref_video_use_audio_2": ref_video_use_audio_2,
+            "ref_video_fps": ref_video_fps,
+            "ref_video_fps_2": ref_video_fps_2,
+            "ref_video_fps_3": ref_video_fps_3,
             "ref_audios": ref_audios or {},
         }
         canvas_payload = {
@@ -611,6 +651,9 @@ class MiniMaxH3EasyExtension(ComfyExtension):
                 {"new_id": "ref_video_size", "old_id": "mode.ref_video_size"},
                 {"new_id": "ref_video_temporal_fit", "old_id": "mode.ref_video_temporal_fit"},
                 {"new_id": "ref_videos", "old_id": "mode.ref_videos"},
+                {"new_id": "ref_video_fps", "old_id": "mode.ref_video_fps"},
+                {"new_id": "ref_video_fps_2", "old_id": "mode.ref_video_fps_2"},
+                {"new_id": "ref_video_fps_3", "old_id": "mode.ref_video_fps_3"},
                 {"new_id": "ref_audios", "old_id": "mode.ref_audios"},
             ],
             output_mapping=[

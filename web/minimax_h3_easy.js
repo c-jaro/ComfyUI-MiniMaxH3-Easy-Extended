@@ -460,6 +460,10 @@ function layoutWidgetVisibility(widget, controller, state) {
     return state.hasEndingFrame && !state.endingFrameDrivesAspect;
   }
 
+  // Retain archived V2 IMAGE-batch FPS values for migration without exposing
+  // obsolete controls beside modern VIDEO inputs, which carry their own FPS.
+  if (is("ref_video_fps") || is("ref_video_fps_2") || is("ref_video_fps_3")) return false;
+
   // Reference preprocessing controls appear only for the corresponding connected
   // media. Audio-only still uses reference-video geometry/FPS, but deliberately
   // ignores the still-image size selector to protect I2A refs from the 32x32 proxy.
@@ -4469,6 +4473,23 @@ function graphContainsLink(graph, linkId) {
   return false;
 }
 
+function clearDisconnectedAutogrowLink(node, linkInfo) {
+  if (!Array.isArray(node?.inputs)) return false;
+  const rawLinkId = Array.isArray(linkInfo)
+    ? linkInfo[0]
+    : (linkInfo && typeof linkInfo === "object" ? (linkInfo.id ?? linkInfo.link_id) : linkInfo);
+  if (rawLinkId == null) return false;
+  const input = node.inputs.find((candidate) => {
+    const link = candidate?.link;
+    const inputLinkId = link && typeof link === "object" ? (link.id ?? link.link_id ?? link[0]) : link;
+    return inputLinkId != null && String(inputLinkId) === String(rawLinkId);
+  });
+  const leaf = String(input?.name ?? "").split(/[.:/]/).at(-1) || "";
+  if (!/^(?:keyframe|ref_image|ref_video|ref_audio)_\d+$/.test(leaf)) return false;
+  input.link = null;
+  return true;
+}
+
 function clearDanglingInputLinks(node) {
   const graph = node?.graph;
   if (!graph || !Array.isArray(node?.inputs)) return false;
@@ -4536,6 +4557,7 @@ function attachNodeObservers(node, controller) {
   const connections = function (...args) {
     const result = previousConnections?.apply(this, args);
     const connected = args[2];
+    if (connected === false) clearDisconnectedAutogrowLink(this, args[3]);
     // Refresh after native Autogrow settles. Only repair dangling link ids on
     // an actual disconnect; doing that during connection creation can race the
     // graph link store and erase a newly-created Reference connection.
@@ -4606,9 +4628,9 @@ app.registerExtension({
       }
     }
     if (!legacyMigrationCount) return;
-    const message = `MiniMax H3 Easy v2 upgraded ${legacyMigrationCount} legacy node${legacyMigrationCount === 1 ? "" : "s"}. Reconnect legacy Media references once; v2 uses real typed Autogrow sockets.`;
+    const message = `MiniMax H3 Easy V4 upgraded ${legacyMigrationCount} legacy node${legacyMigrationCount === 1 ? "" : "s"}. Reconnect legacy Media references once; V4 uses real typed Autogrow sockets.`;
     console.warn(`[MiniMax H3 Easy] ${message}`);
-    app.extensionManager?.toast?.add?.({ severity: "warn", summary: "MiniMax H3 Easy v2", detail: message, life: 9000 });
+    app.extensionManager?.toast?.add?.({ severity: "warn", summary: "MiniMax H3 Easy V4", detail: message, life: 9000 });
     legacyMigrationCount = 0;
   },
   nodeCreated(node) {

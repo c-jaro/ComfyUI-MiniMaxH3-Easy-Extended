@@ -1809,6 +1809,7 @@ def generate(bundle: MiniMaxH3Bundle, mode: dict[str, Any], prompt: str, canvas:
         compiled = _compile_reference_prompt(
             prompt, image_count, video_count, standalone_audio_count, paired_soundtrack_count, video_soundtrack_ordinals
         )
+        model = bundle.model_for(provision)
         core_out = h3.MiniMaxH3ReferenceToVideo.execute(
             clip=bundle.clip,
             vae=bundle.video_vae,
@@ -1824,7 +1825,6 @@ def generate(bundle: MiniMaxH3Bundle, mode: dict[str, Any], prompt: str, canvas:
             ref_audios=ref_audios,
         )
         conditioning, latent = core_out.result
-        model = bundle.model_for(provision)
         ref_info = reference_report(
             ref_images_raw, ref_videos, ref_video_audios, ref_audios,
             ref_balance_w, ref_balance_h, effective_ref_image_size, frame_count, video_records, audio_records,
@@ -1870,6 +1870,7 @@ def generate(bundle: MiniMaxH3Bundle, mode: dict[str, Any], prompt: str, canvas:
             prepared_first_frame, first_frame_prefit = _prepare_first_frame(first_frame, width, height, first_frame_resize)
         prepared_last_frame, last_frame_prefit = _prepare_last_frame(last_frame, width, height, last_frame_resize)
         compiled = _compile_base_prompt(prompt, keyframe_count, role)
+        model = bundle.model_for(provision)
         core_out = h3.MiniMaxH3ImageToVideo.execute(
             clip=bundle.clip,
             vae=bundle.video_vae,
@@ -1881,7 +1882,6 @@ def generate(bundle: MiniMaxH3Bundle, mode: dict[str, Any], prompt: str, canvas:
             last_frame=prepared_last_frame,
         )
         conditioning, latent = core_out.result
-        model = bundle.model_for(provision)
         ref_info = keyframe_report(
             first_frame, last_frame, width, height, keyframe_canvas, canvas,
             first_frame_resize, first_frame_prefit,

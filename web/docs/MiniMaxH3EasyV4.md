@@ -62,4 +62,4 @@ Connected inputs, not Model, choose conditioning. Any Reference image, video, or
 
 Easy Loader exposes FL2VA and REF2VA checkpoint provisions. **MiniMax H3 Easy -> Model** explicitly chooses which provision runs, including in Audio-only mode.
 
-The Easy node does not own a sampling-seed control. The bundled example's downstream `RandomNoise` node is set to seed `0` with automatic randomization after generation; set that node to fixed when repeatable sampling noise is required. Current ComfyUI H3 separately uses a fixed internal seed `0` for its 0.1% visual-reference conditioning-noise augmentation. That internal seed is not the sampler seed, and audio-reference augmentation adds no noise.
+The Easy node does not own a sampling-seed control. The bundled example's downstream `RandomNoise` node is set to seed `0` with automatic randomization after generation; set that node to fixed when repeatable sampling noise is required. The current native H3 conditioning nodes expose no separate Reference-conditioning seed control.
