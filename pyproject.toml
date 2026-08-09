@@ -1,16 +1,16 @@
 [project]
-name = "comfyui-minimaxh3-easy"
-description = "A streamlined MiniMax H3 workflow for text-to-video, image-to-video, and reference-to-video generation in ComfyUI."
-version = "1.0.3"
+name = "minimaxh3-easy-extended"
+description = "Extended MiniMax H3 workflow nodes for ComfyUI."
+version = "2.0.56"
 license = { file = "LICENSE" }
 dependencies = []
 
 [project.urls]
-Repository = "https://github.com/nkxx188/ComfyUI-MiniMaxH3-Easy"
-Documentation = "https://github.com/nkxx188/ComfyUI-MiniMaxH3-Easy#readme"
-"Bug Tracker" = "https://github.com/nkxx188/ComfyUI-MiniMaxH3-Easy/issues"
+Repository = "https://github.com/c-jaro/ComfyUI-MiniMaxH3-Easy-Extended"
+Documentation = "https://github.com/c-jaro/ComfyUI-MiniMaxH3-Easy-Extended#readme"
+"Bug Tracker" = "https://github.com/c-jaro/ComfyUI-MiniMaxH3-Easy-Extended/issues"
 
 [tool.comfy]
-PublisherId = "nkxx188"
-DisplayName = "ComfyUI-MiniMaxH3-Easy"
+PublisherId = "c-jaro"
+DisplayName = "MiniMax H3 Easy Extended"
 Icon = ""
