@@ -16,9 +16,9 @@ Press **Tab** on an empty prompt to pick a starter such as T2V/T2VA, REF2VA, T2A
 - typing replaces the selected field
 
 <p align="center">
-  <video src="https://github.com/user-attachments/assets/03407126-93a0-4553-b436-403968bd7df2" width="32%" controls></video>
-  <video src="https://github.com/user-attachments/assets/ae497179-4513-463f-8a81-048d123a06cf" width="32%" controls></video>
-  <video src="https://github.com/user-attachments/assets/4f1534b2-0228-4f1a-9bb2-685dfe9c295f" width="32%" controls></video>
+  <video src="https://github.com/user-attachments/assets/03407126-93a0-4553-b436-403968bd7df2" width="400px" controls></video>
+  <video src="https://github.com/user-attachments/assets/ae497179-4513-463f-8a81-048d123a06cf" width="400px" controls></video>
+  <video src="https://github.com/user-attachments/assets/4f1534b2-0228-4f1a-9bb2-685dfe9c295f" width="400px" controls></video>
 </p>
 
 Suggestions change with the current field, so camera, movement, scene, dialogue, voice, sound and other options show up where they are relevant.
