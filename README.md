@@ -58,7 +58,7 @@ Still WIP. UI and behavior may change.
 
 ## Example workflow
 
-An example graph is included in [`minimax_h3_easy-extended.json`](minimax_h3_easy-extended.json).
+An example graph is included in [`workflow/minimax_h3_easy-extended.json`](minimax_h3_easy-extended.json).
 
 The Sage / SolAttn / cache nodes in the example are optional acceleration nodes and are not required by MiniMax H3 Easy itself.
 
