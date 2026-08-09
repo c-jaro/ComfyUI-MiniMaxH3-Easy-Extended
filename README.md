@@ -2,8 +2,8 @@
 > Extended fork of [nkxx188/ComfyUI-MiniMaxH3-Easy](https://github.com/nkxx188/ComfyUI-MiniMaxH3-Easy).
 Builds on the original Easy nodes with H3-specific prompt suggestions, autocomplete, and a handful of fixes & reference/audio improvements.
 
-## Prompting
-The main focus is the prompt editor: less manual H3 prompt structure, fewer tags to remember, and faster reference prompting.
+## Focus
+The main focus of this is easing up on h3 prompting. The model is very sensitive to good prompt structure (especially R2VA) some of the burden of which this is supposed to alleviate.
 
 **SUGGESTIONS BASED ON:**
 - Base prompting: https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md
@@ -17,7 +17,8 @@ Press **Tab** on an empty prompt to choose **Custom** or any T2V, I2V, L2V, FL2V
 
 Reference audio proxies keep the guide's roles separate. `@ImageN` supplies provenance for visible content defined as `@SubjectN`, and `@VideoN` describes editing, continuation, or whole-video timing/structure. `@AudioN` names standalone Reference audio; `@VideoAudioN` names the enabled soundtrack attached to visible Reference Video N. Either audio source needs its own definition and copy/reference relationship. V2A does not treat a video's mere presence as an audio-reuse instruction.
 
-<img width="614" height="900" alt="e7b3544997ab51c1a" src="https://github.com/user-attachments/assets/90573ae1-c6af-459f-8ce2-dd8ab811a398" />
+<img width="428" height="628" alt="20260810_001114" src="https://github.com/user-attachments/assets/e3c4973d-ada5-4aed-9cba-226419588376" />
+
 
 Suggestions change with the current field, so camera, movement, scene, dialogue, voice, sound and other options show up where they are relevant.
 
