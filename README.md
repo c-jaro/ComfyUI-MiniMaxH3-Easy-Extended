@@ -1,5 +1,5 @@
 # ComfyUI-MiniMaxH3-Easy-Extended
-> extended fork of [nkxx188/ComfyUI-MiniMaxH3-Easy](https://github.com/nkxx188/ComfyUI-MiniMaxH3-Easy).
+> Extended fork of [nkxx188/ComfyUI-MiniMaxH3-Easy](https://github.com/nkxx188/ComfyUI-MiniMaxH3-Easy).
 Builds on the original Easy nodes with H3-specific prompt suggestions, autocomplete, and a handful of fixes & reference/audio improvements.
 
 ## Prompting
