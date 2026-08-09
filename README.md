@@ -15,29 +15,11 @@ A compact workflow frontend for ComfyUI's native MiniMax H3 implementation. It p
 - H3-aware templates, autocomplete, editable presets, validation, and Guide navigation
 - a standard sampler/decode output node, audio-only decode node, and resolved-timing Info node
 
-<<<<<<< HEAD
 <p align="center">
 <img width="32%" alt="Reference prompt editor" src="https://github.com/user-attachments/assets/ebe9b992-0807-41fe-808b-4d98e2a233d7" />
 <img width="32%" alt="Text-to-video prompt editor" src="https://github.com/user-attachments/assets/6a082dca-902a-4de4-9b5a-3d860a17ff62" />
 <img width="32%" alt="Prompt editor after changing mode" src="https://github.com/user-attachments/assets/3fcff403-f646-442e-a8e3-370bbca8f26f" />
-=======
-Press **Tab** on an empty prompt to choose **Custom** or any T2V, I2V, L2V, FL2V, R2V, T2A, R2A, I2A, V2A, or A2A starter. On an ordinary unstructured draft, the same menu offers non-destructive wrappers that keep the draft in the official timeline or Reference summary, plus clearly labeled blank-template replacements. Template choice sets only the matching Video/Audio **Mode** and endpoint first/last-frame role; it never changes **Model**, connections, or connected-input conditioning. Reference starters begin with an editable bracketed task relationship from MiniMax's documented six values. T2A/R2A/I2A/V2A/A2A are Easy audio-only proxy template names, not additional MiniMax task types. Templates contain editable fields:
-- **Tab** -> next field
-- **Shift+Tab** -> previous field
-- **Up / Down + Enter** -> choose a contextual suggestion
-- typing replaces the selected field
-
-Reference audio proxies keep the guide's roles separate. `@ImageN` supplies provenance for visible content defined as `@SubjectN`, and `@VideoN` describes editing, continuation, or whole-video timing/structure. `@AudioN` names standalone Reference audio; `@VideoAudioN` names the enabled soundtrack attached to visible Reference Video N. Either audio source needs its own definition and copy/reference relationship. V2A does not treat a video's mere presence as an audio-reuse instruction.
-
-
-
-<p>
-<img width="32%" alt="1" src="https://github.com/user-attachments/assets/58564f04-b1e1-43a6-b94c-b0dc7792a01b" />
-<img width="32%" alt="2" src="https://github.com/user-attachments/assets/08a7e0e5-ad2b-42d8-8da4-ac1b5a47098c" />
-<img width="32%" alt="3" src="https://github.com/user-attachments/assets/fe38c985-f490-4740-8f66-ad4807d50f92" />
->>>>>>> b2307a719b43137ca3cf9bd9f27ec4bb2e8721fd
 </p>
-<img width="32%" alt="3_" src="https://github.com/user-attachments/assets/f7003c65-a12a-492d-bfc6-c5c2dc758e3e" />
 
 ## Requirements and installation
 
