@@ -16,9 +16,11 @@ A compact workflow frontend for ComfyUI's native MiniMax H3 implementation. It p
 - a standard sampler/decode output node, audio-only decode node, and resolved-timing Info node
 
 <p align="center">
-<img width="32%" alt="Reference prompt editor" src="https://github.com/user-attachments/assets/ebe9b992-0807-41fe-808b-4d98e2a233d7" />
-<img width="32%" alt="Text-to-video prompt editor" src="https://github.com/user-attachments/assets/6a082dca-902a-4de4-9b5a-3d860a17ff62" />
-<img width="32%" alt="Prompt editor after changing mode" src="https://github.com/user-attachments/assets/3fcff403-f646-442e-a8e3-370bbca8f26f" />
+<img width="800" height="666" alt="1" src="https://github.com/user-attachments/assets/0d4a4721-376d-48b2-bb30-0c7f0a1193cb" />
+<img width="800" height="666" alt="3" src="https://github.com/user-attachments/assets/514fc74d-52f5-45d4-bd67-9ef5ef555c81" />
+<img width="800" height="666" alt="2" src="https://github.com/user-attachments/assets/de0835a1-029d-4c67-b858-33a3796ab6bd" />
+<img width="698" height="900" alt="3_" src="https://github.com/user-attachments/assets/bac21c82-9222-4c18-b968-6abf93ceb2fd" />
+
 </p>
 
 ## Requirements and installation
