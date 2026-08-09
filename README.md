@@ -1,12 +1,13 @@
 # ComfyUI-MiniMaxH3-Easy-Extended
-
-> **WIP** extended fork of [nkxx188/ComfyUI-MiniMaxH3-Easy](https://github.com/nkxx188/ComfyUI-MiniMaxH3-Easy).
-
+> extended fork of [nkxx188/ComfyUI-MiniMaxH3-Easy](https://github.com/nkxx188/ComfyUI-MiniMaxH3-Easy).
 Extends the original Easy nodes with broader MiniMax H3 workflow support, improved reference/audio handling, and a prompt editor built around H3's prompting format.
 
 ## Prompting
-
-The main focus is the prompt editor: less manual H3 prompt structure, fewer tags to remember, and faster reference prompting.
+The main focus is the prompt editor: less manual H3 prompt structure, fewer tags to remember, and faster reference prompting. 
+BASED ON:
+- Base prompting: https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_base_en.md
+- Reference prompting: https://huggingface.co/MiniMaxAI/MiniMax-H3/blob/main/docs/VIDEO_PROMPT_WRITING_GUIDE_ref_en.md
+- H3 docs: https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/main/docs
 
 Press **Tab** on an empty prompt to pick a starter such as T2V/T2VA, REF2VA, T2A or REF2A. Templates contain editable fields:
 
